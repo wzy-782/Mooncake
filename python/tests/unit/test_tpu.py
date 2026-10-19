@@ -16,31 +16,31 @@ class FakeAdapterLib:
 
     def __init__(self):
         self.provider_path = None
-        self.registered = {}  # token -> handle
+        self.registered = {}  # fake_addr -> handle
         self.released = []
-        self.next_token = 0x7F0000000000
+        self.next_fake_addr = 0x7F0000000000
         self.fail_handles = set()
 
     def mc_tpu_adapter_load_provider(self, path):
         self.provider_path = path.decode()
         return 0
 
-    def mc_tpu_adapter_register(self, handle, token_ref, size_ref, device_ref):
+    def mc_tpu_adapter_register(self, handle, fake_addr_ref, size_ref, device_ref):
         if handle in self.fail_handles:
             self.released.append(handle)  # adapter owns it even on failure
             return 1
-        token = self.next_token
-        self.next_token += 1 << 30
-        self.registered[token] = handle
-        token_ref._obj.value = token
+        fake_addr = self.next_fake_addr
+        self.next_fake_addr += 1 << 30
+        self.registered[fake_addr] = handle
+        fake_addr_ref._obj.value = fake_addr
         size_ref._obj.value = 4096 * handle
         device_ref._obj.value = handle % 4
         return 0
 
-    def mc_tpu_adapter_unregister(self, token):
-        if token not in self.registered:
+    def mc_tpu_adapter_unregister(self, fake_addr):
+        if fake_addr not in self.registered:
             return 1
-        self.released.append(self.registered.pop(token))
+        self.released.append(self.registered.pop(fake_addr))
         return 0
 
     def mc_tpu_adapter_release_buffer(self, handle):
@@ -97,14 +97,14 @@ class TpuTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             tpu.unregister(shards[0], adapter=self.adapter)
 
-    def test_register_with_engine_passes_tokens_and_sizes(self):
+    def test_register_with_engine_passes_fake_addrs_and_sizes(self):
         shards = tpu.prepare([[1], [2]], provider=self.provider, adapter=self.adapter)
         engine = mock.Mock()
         engine.batch_register_memory.return_value = 0
 
         tpu.register_with_engine(engine, shards)
         engine.batch_register_memory.assert_called_once_with(
-            [shards[0][0].token, shards[1][0].token], [4096, 8192]
+            [shards[0][0].fake_addr, shards[1][0].fake_addr], [4096, 8192]
         )
 
     def test_register_with_engine_raises_on_error(self):

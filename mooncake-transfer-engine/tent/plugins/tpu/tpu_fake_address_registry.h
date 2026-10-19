@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Token registry for Mooncake's built-in TPU adapter.
+// Fake-address registry for Mooncake's built-in TPU adapter.
 //
 // TENT is built around raw addresses: it registers memory by address, splits
 // staged transfers into chunks by pointer arithmetic, and asks the adapter to
 // copy `address + offset`. A TPU buffer has no such address. The registry
 // bridges the two:
 //
-//   * Each registered device region gets a TOKEN: the base of a reserved,
-//     inaccessible (PROT_NONE) virtual address range as large as the region.
-//     Tokens never alias real host memory, and any code path that dereferences
-//     one faults immediately instead of silently reading unrelated bytes.
-//   * Any address inside [token, token + size) resolves back to
+//   * Each registered device region gets a FAKE ADDRESS: the base of a
+//     reserved, inaccessible (PROT_NONE) virtual address range as large as
+//     the region. Fake addresses never alias real host memory, and any code
+//     path that dereferences one faults immediately instead of silently
+//     reading unrelated bytes.
+//   * Any address inside [fake_addr, fake_addr + size) resolves back to
 //     (region, offset). ProxyManager passes such INTERIOR addresses
-//     (`token + chunk_offset`) for every chunk after the first, so this is
+//     (`fake_addr + chunk_offset`) for every chunk after the first, so this is
 //     load-bearing (see tpu_pjrt_abi.h).
 //
 // The registry only sees DeviceRegion; tpu_pjrt_adapter.cpp backs regions with
@@ -34,8 +35,8 @@
 // This code runs inside a dlopen()ed plugin, so it depends only on the C++
 // standard library and POSIX.
 
-#ifndef TENT_PLUGINS_TPU_TPU_TOKEN_REGISTRY_H_
-#define TENT_PLUGINS_TPU_TPU_TOKEN_REGISTRY_H_
+#ifndef TENT_PLUGINS_TPU_TPU_FAKE_ADDRESS_REGISTRY_H_
+#define TENT_PLUGINS_TPU_TPU_FAKE_ADDRESS_REGISTRY_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -73,25 +74,25 @@ class DeviceRegion {
                               size_t len) = 0;
 };
 
-class TpuTokenRegistry {
+class TpuFakeAddressRegistry {
    public:
-    TpuTokenRegistry() = default;
-    ~TpuTokenRegistry();
-    TpuTokenRegistry(const TpuTokenRegistry &) = delete;
-    TpuTokenRegistry &operator=(const TpuTokenRegistry &) = delete;
+    TpuFakeAddressRegistry() = default;
+    ~TpuFakeAddressRegistry();
+    TpuFakeAddressRegistry(const TpuFakeAddressRegistry &) = delete;
+    TpuFakeAddressRegistry &operator=(const TpuFakeAddressRegistry &) = delete;
 
     // Process-wide instance behind the adapter's C entry points.
-    static TpuTokenRegistry &instance();
+    static TpuFakeAddressRegistry &instance();
 
-    // Registers `region` and returns its token, or 0 on failure (null or empty
-    // region, negative device index, or address-space reservation failure).
-    // On failure the region is destroyed.
+    // Registers `region` and returns its fake address, or 0 on failure (null or
+    // empty region, negative device index, or address-space reservation
+    // failure). On failure the region is destroyed.
     uintptr_t add(std::unique_ptr<DeviceRegion> region);
 
-    // Unregisters the region whose token is exactly `token`. Returns false if
-    // there is none. Copies already in flight keep the region alive until they
-    // finish. The device stays known (see deviceCount).
-    bool remove(uintptr_t token);
+    // Unregisters the region whose fake address is exactly `fake_addr`. Returns
+    // false if there is none. Copies already in flight keep the region alive
+    // until they finish. The device stays known (see deviceCount).
+    bool remove(uintptr_t fake_addr);
 
     // --- Operations behind the mc_tpu_pjrt_* ABI ---------------------------
 
@@ -115,8 +116,8 @@ class TpuTokenRegistry {
     // NUMA node recorded for device `index`, or -1.
     int deviceNuma(int index) const;
 
-    // Size in bytes of the region whose token is exactly `token`, or 0.
-    size_t regionSize(uintptr_t token) const;
+    // Size in bytes of the region starting exactly at `fake_addr`, or 0.
+    size_t regionSize(uintptr_t fake_addr) const;
 
     // Number of registered regions.
     size_t size() const;
@@ -134,11 +135,11 @@ class TpuTokenRegistry {
                                           size_t *offset) const;
 
     mutable std::shared_mutex mutex_;
-    std::map<uintptr_t, Entry> regions_;  // keyed by token (range base)
+    std::map<uintptr_t, Entry> regions_;  // keyed by fake address (range base)
     std::map<int, int> device_numa_;      // device index -> NUMA (sticky)
 };
 
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // TENT_PLUGINS_TPU_TPU_TOKEN_REGISTRY_H_
+#endif  // TENT_PLUGINS_TPU_TPU_FAKE_ADDRESS_REGISTRY_H_

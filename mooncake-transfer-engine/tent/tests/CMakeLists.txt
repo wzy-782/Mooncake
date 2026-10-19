@@ -736,18 +736,19 @@ if(USE_TPU)
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 
-  # Token registry of the built-in TPU adapter (tent/plugins/tpu). The
+  # Fake-address registry of the built-in TPU adapter (tent/plugins/tpu). The
   # registry's symbols are hidden in the adapter library, so the test compiles
   # its source directly.
   add_executable(
-    tent_tpu_token_registry_test
-    tpu/tpu_token_registry_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_token_registry.cpp)
-  target_link_libraries(tent_tpu_token_registry_test PRIVATE gtest gtest_main)
-  target_include_directories(tent_tpu_token_registry_test
+    tent_tpu_fake_address_registry_test
+    tpu/tpu_fake_address_registry_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_fake_address_registry.cpp)
+  target_link_libraries(tent_tpu_fake_address_registry_test PRIVATE gtest
+                                                                    gtest_main)
+  target_include_directories(tent_tpu_fake_address_registry_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu)
-  add_test(NAME tent_tpu_token_registry_test
-           COMMAND tent_tpu_token_registry_test)
+  add_test(NAME tent_tpu_fake_address_registry_test
+           COMMAND tent_tpu_fake_address_registry_test)
 
   # Mock TPU buffer provider (tpu_buffer_provider.h) standing in for tpu-sync.
   add_library(mock_tpu_buffer_provider SHARED tpu/mock_tpu_buffer_provider.cpp)

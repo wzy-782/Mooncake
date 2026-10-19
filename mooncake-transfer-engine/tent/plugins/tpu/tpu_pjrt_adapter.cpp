@@ -13,8 +13,9 @@
 // limitations under the License.
 
 // Mooncake's built-in TPU adapter. Implements TENT's adapter ABI
-// (tpu_pjrt_abi.h) on top of the token registry, delegating the actual device
-// copies to a TPU buffer provider (tpu_buffer_provider.h), e.g. tpu-sync.
+// (tpu_pjrt_abi.h) on top of the fake-address registry, delegating the actual
+// device copies to a TPU buffer provider (tpu_buffer_provider.h), e.g.
+// tpu-sync.
 
 // The library is built with hidden visibility; only the C entry points
 // declared in these headers are exported.
@@ -32,7 +33,7 @@
 #include <string>
 
 #include "tent/platform/tpu_buffer_provider.h"
-#include "tpu_token_registry.h"
+#include "tpu_fake_address_registry.h"
 
 namespace mooncake {
 namespace tent {
@@ -107,7 +108,7 @@ class ProviderRegion : public DeviceRegion {
 }  // namespace mooncake
 
 using mooncake::tent::tpuAdapterLog;
-using mooncake::tent::TpuTokenRegistry;
+using mooncake::tent::TpuFakeAddressRegistry;
 
 extern "C" {
 
@@ -151,7 +152,7 @@ int mc_tpu_adapter_load_provider(const char *path) {
     return 0;
 }
 
-int mc_tpu_adapter_register(uint64_t buffer, uint64_t *token_out,
+int mc_tpu_adapter_register(uint64_t buffer, uint64_t *fake_addr_out,
                             uint64_t *size_out, int *device_out) {
     using namespace mooncake::tent;
     const mc_tpu_buffer_provider_t *provider = boundProvider();
@@ -164,17 +165,19 @@ int mc_tpu_adapter_register(uint64_t buffer, uint64_t *token_out,
     auto region = std::make_unique<ProviderRegion>(provider, buffer);
     const size_t size = region->size();
     const int device = region->deviceIndex();
-    if (!token_out || !size_out || !device_out) return 1;
-    const uintptr_t token = TpuTokenRegistry::instance().add(std::move(region));
-    if (token == 0) return 1;
-    *token_out = token;
+    if (!fake_addr_out || !size_out || !device_out) return 1;
+    const uintptr_t fake_addr =
+        TpuFakeAddressRegistry::instance().add(std::move(region));
+    if (fake_addr == 0) return 1;
+    *fake_addr_out = fake_addr;
     *size_out = size;
     *device_out = device;
     return 0;
 }
 
-int mc_tpu_adapter_unregister(uint64_t token) {
-    return TpuTokenRegistry::instance().remove(static_cast<uintptr_t>(token))
+int mc_tpu_adapter_unregister(uint64_t fake_addr) {
+    return TpuFakeAddressRegistry::instance().remove(
+               static_cast<uintptr_t>(fake_addr))
                ? 0
                : 1;
 }
@@ -194,7 +197,7 @@ int mc_tpu_adapter_release_buffer(uint64_t buffer) {
 // here makes TENT disable TPU support loudly instead of running with an empty
 // TPU topology.
 int mc_tpu_pjrt_init(void) {
-    if (TpuTokenRegistry::instance().deviceCount() == 0) {
+    if (TpuFakeAddressRegistry::instance().deviceCount() == 0) {
         tpuAdapterLog(
             "no TPU buffers are registered. Register them (e.g. with "
             "mooncake.tpu.prepare) before creating the TransferEngine.");
@@ -204,27 +207,29 @@ int mc_tpu_pjrt_init(void) {
 }
 
 int mc_tpu_pjrt_is_device_ptr(const void *addr) {
-    return TpuTokenRegistry::instance().contains(addr) ? 1 : 0;
+    return TpuFakeAddressRegistry::instance().contains(addr) ? 1 : 0;
 }
 
 int mc_tpu_pjrt_device_index(const void *addr) {
-    return TpuTokenRegistry::instance().deviceIndex(addr);
+    return TpuFakeAddressRegistry::instance().deviceIndex(addr);
 }
 
 int mc_tpu_pjrt_copy_d2h(void *host_dst, const void *device_src, size_t len) {
-    return TpuTokenRegistry::instance().copyD2H(host_dst, device_src, len);
+    return TpuFakeAddressRegistry::instance().copyD2H(host_dst, device_src,
+                                                      len);
 }
 
 int mc_tpu_pjrt_copy_h2d(void *device_dst, const void *host_src, size_t len) {
-    return TpuTokenRegistry::instance().copyH2D(device_dst, host_src, len);
+    return TpuFakeAddressRegistry::instance().copyH2D(device_dst, host_src,
+                                                      len);
 }
 
 int mc_tpu_pjrt_device_count(void) {
-    return TpuTokenRegistry::instance().deviceCount();
+    return TpuFakeAddressRegistry::instance().deviceCount();
 }
 
 int mc_tpu_pjrt_device_numa(int index) {
-    return TpuTokenRegistry::instance().deviceNuma(index);
+    return TpuFakeAddressRegistry::instance().deviceNuma(index);
 }
 
 }  // extern "C"

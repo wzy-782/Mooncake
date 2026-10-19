@@ -39,14 +39,15 @@ int mc_tpu_adapter_load_provider(const char *path);
 
 // Registers provider handle `buffer`. The adapter takes ownership of the handle
 // even on failure, and releases it once it is unregistered and no copy uses
-// it. On success writes the buffer's token (the address to register with the
-// TransferEngine), size in bytes and device index, and returns 0.
-int mc_tpu_adapter_register(uint64_t buffer, uint64_t *token_out,
+// it. On success writes the buffer's fake address (the address to register with
+// the TransferEngine), size in bytes and device index, and returns 0.
+int mc_tpu_adapter_register(uint64_t buffer, uint64_t *fake_addr_out,
                             uint64_t *size_out, int *device_out);
 
-// Unregisters the buffer whose token is exactly `token`. Unregister it from the
-// TransferEngine first. Returns 0 on success, non-zero for an unknown token.
-int mc_tpu_adapter_unregister(uint64_t token);
+// Unregisters the buffer whose fake address is exactly `fake_addr`. Unregister
+// it from the TransferEngine first. Returns 0 on success, non-zero for an
+// unknown fake address.
+int mc_tpu_adapter_unregister(uint64_t fake_addr);
 
 // Releases a provider handle that was never passed to mc_tpu_adapter_register
 // (e.g. when registering a batch fails part-way). Returns 0 on success.

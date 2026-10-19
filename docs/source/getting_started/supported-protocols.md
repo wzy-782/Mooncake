@@ -430,7 +430,7 @@ copies to a pluggable TPU buffer provider; a JAX provider built on
 
 **Usage:** register the framework's device arrays with the adapter *before*
 creating the `TransferEngine` (TENT reads the TPU device topology from the
-adapter once, at construction), then register the returned tokens with the
+adapter once, at construction), then register the returned fake addresses with the
 engine:
 
 ```python
@@ -446,8 +446,8 @@ engine.initialize(...)
 tpu.register_with_engine(engine, shards)  # TENT records each as "tpu:N"
 ```
 
-Tokens are addresses for Mooncake's bookkeeping only and must never be
-dereferenced. Byte offsets within a token index the buffer's on-device layout,
+Fake addresses are for Mooncake's bookkeeping only and must never be
+dereferenced. Byte offsets within a fake address index the buffer's on-device layout,
 so both ends of a transfer must use identical shapes, dtypes and shardings.
 
 **Design notes:**
@@ -459,8 +459,8 @@ so both ends of a transfer must use identical shapes, dtypes and shardings.
   be overridden with `MC_TPU_PJRT_LIB`, which `mooncake.tpu` sets to the
   packaged adapter so that TENT and Python share one registry. A custom adapter
   implementing the same ABI can still be used instead.
-- Each registered buffer gets a token: an inaccessible reserved address range of
-  the buffer's size. Interior addresses (`token + offset`) resolve back to the
+- Each registered buffer gets a fake address: an inaccessible reserved address range of
+  the buffer's size. Interior addresses (`fake_address + offset`) resolve back to the
   buffer, which the chunked staging pipeline relies on.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.

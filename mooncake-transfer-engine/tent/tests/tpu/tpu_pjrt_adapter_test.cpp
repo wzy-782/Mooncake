@@ -104,7 +104,7 @@ class TpuPjrtAdapterTest : public ::testing::Test {
 
     struct Registered {
         uint64_t handle = 0;
-        uint64_t token = 0;
+        uint64_t fake_addr = 0;
         uint64_t size = 0;
         int device = -1;
     };
@@ -112,7 +112,7 @@ class TpuPjrtAdapterTest : public ::testing::Test {
     Registered registerNew(size_t size, int device, int numa) {
         Registered r;
         r.handle = create_(size, device, numa);
-        EXPECT_EQ(register_(r.handle, &r.token, &r.size, &r.device), 0);
+        EXPECT_EQ(register_(r.handle, &r.fake_addr, &r.size, &r.device), 0);
         return r;
     }
 
@@ -136,9 +136,10 @@ void *TpuPjrtAdapterTest::adapter_ = nullptr;
 void *TpuPjrtAdapterTest::provider_ = nullptr;
 
 TEST_F(TpuPjrtAdapterTest, RejectsIncompatibleProvidersThenBindsOnce) {
-    uint64_t token = 0, size = 0;
+    uint64_t fake_addr = 0, size = 0;
     int device = -1;
-    EXPECT_NE(register_(1, &token, &size, &device), 0);  // nothing bound yet
+    EXPECT_NE(register_(1, &fake_addr, &size, &device),
+              0);  // nothing bound yet
 
     EXPECT_NE(load_(nullptr), 0);
     EXPECT_NE(load_(""), 0);
@@ -157,7 +158,7 @@ TEST_F(TpuPjrtAdapterTest, InitFailsUntilABufferIsRegistered) {
     EXPECT_NE(init_(), 0);
     Registered r = registerNew(kChunk, /*device=*/0, /*numa=*/0);
     EXPECT_EQ(init_(), 0);
-    EXPECT_EQ(unregister_(r.token), 0);
+    EXPECT_EQ(unregister_(r.fake_addr), 0);
     EXPECT_EQ(init_(), 0);  // devices stay known after unregistering
 }
 
@@ -165,29 +166,29 @@ TEST_F(TpuPjrtAdapterTest, RegisterAdoptsHandleAndUnregisterReleasesIt) {
     const int live_before = live_();
     const int released_before = released_();
     Registered r = registerNew(3 * kChunk, /*device=*/2, /*numa=*/1);
-    EXPECT_NE(r.token, 0u);
+    EXPECT_NE(r.fake_addr, 0u);
     EXPECT_EQ(r.size, 3 * kChunk);
     EXPECT_EQ(r.device, 2);
     EXPECT_EQ(live_(), live_before + 1);
 
-    EXPECT_EQ(unregister_(r.token), 0);
+    EXPECT_EQ(unregister_(r.fake_addr), 0);
     EXPECT_EQ(released_(), released_before + 1);
     EXPECT_EQ(live_(), live_before);
     EXPECT_EQ(data_(r.handle), nullptr);
-    EXPECT_NE(unregister_(r.token), 0);
+    EXPECT_NE(unregister_(r.fake_addr), 0);
 }
 
 TEST_F(TpuPjrtAdapterTest, FailedRegistrationStillReleasesTheHandle) {
-    uint64_t token = 0, size = 0;
+    uint64_t fake_addr = 0, size = 0;
     int device = -1;
     // Invalid device index: the registry refuses the region.
     const uint64_t bad = create_(kChunk, /*device=*/-1, /*numa=*/0);
     const int released_before = released_();
-    EXPECT_NE(register_(bad, &token, &size, &device), 0);
+    EXPECT_NE(register_(bad, &fake_addr, &size, &device), 0);
     EXPECT_EQ(released_(), released_before + 1);
     EXPECT_EQ(data_(bad), nullptr);
 
-    EXPECT_NE(register_(0, &token, &size, &device), 0);
+    EXPECT_NE(register_(0, &fake_addr, &size, &device), 0);
 }
 
 TEST_F(TpuPjrtAdapterTest, ReleaseBufferDropsAnUnadoptedHandle) {
@@ -198,31 +199,32 @@ TEST_F(TpuPjrtAdapterTest, ReleaseBufferDropsAnUnadoptedHandle) {
     EXPECT_NE(release_(0), 0);
 }
 
-TEST_F(TpuPjrtAdapterTest, AbiCopiesThroughInteriorTokensReachTheProvider) {
+TEST_F(TpuPjrtAdapterTest,
+       AbiCopiesThroughInteriorFakeAddressesReachTheProvider) {
     Registered r = registerNew(3 * kChunk, 0, 0);
     uint8_t *device_bytes = data_(r.handle);
     ASSERT_NE(device_bytes, nullptr);
-    auto *token = reinterpret_cast<uint8_t *>(r.token);
+    auto *fake_addr = reinterpret_cast<uint8_t *>(r.fake_addr);
     std::vector<uint8_t> host(kChunk);
 
     // Chunk #1, D2H through an interior address.
-    ASSERT_EQ(d2h_(host.data(), token + kChunk, kChunk), 0);
+    ASSERT_EQ(d2h_(host.data(), fake_addr + kChunk, kChunk), 0);
     EXPECT_EQ(0, std::memcmp(host.data(), device_bytes + kChunk, kChunk));
 
     // Chunk #2, H2D through an interior address.
     std::memset(host.data(), 0x5A, kChunk);
-    ASSERT_EQ(h2d_(token + 2 * kChunk, host.data(), kChunk), 0);
+    ASSERT_EQ(h2d_(fake_addr + 2 * kChunk, host.data(), kChunk), 0);
     EXPECT_EQ(device_bytes[2 * kChunk], 0x5A);
     EXPECT_EQ(device_bytes[3 * kChunk - 1], 0x5A);
     EXPECT_NE(device_bytes[2 * kChunk - 1], 0x5A);
 
     // Past the end fails instead of truncating; provider errors propagate.
-    EXPECT_NE(d2h_(host.data(), token + 2 * kChunk + 1, kChunk), 0);
+    EXPECT_NE(d2h_(host.data(), fake_addr + 2 * kChunk + 1, kChunk), 0);
     set_fail_(1);
-    EXPECT_NE(d2h_(host.data(), token, kChunk), 0);
-    EXPECT_NE(h2d_(token, host.data(), kChunk), 0);
+    EXPECT_NE(d2h_(host.data(), fake_addr, kChunk), 0);
+    EXPECT_NE(h2d_(fake_addr, host.data(), kChunk), 0);
 
-    EXPECT_EQ(unregister_(r.token), 0);
+    EXPECT_EQ(unregister_(r.fake_addr), 0);
 }
 
 // The shim is what TENT uses. Buffers are registered before its singleton is
@@ -238,21 +240,21 @@ TEST_F(TpuPjrtAdapterTest, RealShimLoadsAdapterAndCopies) {
     EXPECT_EQ(shim.deviceCount(), 4);
     EXPECT_EQ(shim.deviceNumaNode(3), 1);
 
-    auto *token = reinterpret_cast<uint8_t *>(r0.token);
+    auto *fake_addr = reinterpret_cast<uint8_t *>(r0.fake_addr);
     std::vector<uint8_t> host(kChunk);
-    EXPECT_TRUE(shim.isDevicePtr(token + kChunk + 5));
+    EXPECT_TRUE(shim.isDevicePtr(fake_addr + kChunk + 5));
     EXPECT_FALSE(shim.isDevicePtr(host.data()));
-    EXPECT_EQ(shim.deviceIndex(reinterpret_cast<void *>(r3.token + 7)), 3);
+    EXPECT_EQ(shim.deviceIndex(reinterpret_cast<void *>(r3.fake_addr + 7)), 3);
 
-    ASSERT_TRUE(shim.copyD2H(host.data(), token + kChunk, kChunk).ok());
+    ASSERT_TRUE(shim.copyD2H(host.data(), fake_addr + kChunk, kChunk).ok());
     EXPECT_EQ(0, std::memcmp(host.data(), device_bytes + kChunk, kChunk));
     std::memset(host.data(), 0x33, kChunk);
-    ASSERT_TRUE(shim.copyH2D(token, host.data(), kChunk).ok());
+    ASSERT_TRUE(shim.copyH2D(fake_addr, host.data(), kChunk).ok());
     EXPECT_EQ(device_bytes[0], 0x33);
-    EXPECT_FALSE(shim.copyD2H(host.data(), token + 3 * kChunk, 1).ok());
+    EXPECT_FALSE(shim.copyD2H(host.data(), fake_addr + 3 * kChunk, 1).ok());
 
-    EXPECT_EQ(unregister_(r0.token), 0);
-    EXPECT_EQ(unregister_(r3.token), 0);
+    EXPECT_EQ(unregister_(r0.fake_addr), 0);
+    EXPECT_EQ(unregister_(r3.fake_addr), 0);
 }
 
 }  // namespace

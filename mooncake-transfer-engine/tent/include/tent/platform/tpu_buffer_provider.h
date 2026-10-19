@@ -20,8 +20,8 @@
 // Why a provider: reaching a framework array's device buffer requires
 // framework/runtime internals (for JAX, jaxlib and XLA headers at the exact
 // installed version), which Mooncake does not build against. The provider is
-// built with the framework and exposes only this C table; Mooncake keeps the
-// address bookkeeping TENT needs (tokens, interior pointers) in its adapter.
+// built with the framework and exposes only this C table; Mooncake's adapter
+// keeps the address bookkeeping TENT needs (fake addresses, interior pointers).
 //
 // Discovery mirrors tent/device_plugin.h: the provider library exports one
 // symbol, MC_TPU_BUFFER_PROVIDER_ENTRY, which fills a versioned function table.

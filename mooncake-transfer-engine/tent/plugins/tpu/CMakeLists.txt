@@ -6,7 +6,7 @@
 # processes that may not expose Mooncake's own dependencies.
 
 add_library(tent_tpu_pjrt_adapter SHARED tpu_pjrt_adapter.cpp
-                                         tpu_token_registry.cpp)
+                                         tpu_fake_address_registry.cpp)
 
 target_link_libraries(tent_tpu_pjrt_adapter PRIVATE tent_plugin
                                                     ${CMAKE_DL_LIBS})

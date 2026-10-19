@@ -42,10 +42,10 @@ Typical use, in the process that owns the arrays (requires Mooncake built with
     engine = TransferEngine()
     engine.initialize(...)
 
-    # 2. Register the shards' tokens; TENT records each as "tpu:<device>".
+    # 2. Register the shards' fake addresses; TENT records each as "tpu:<device>".
     tpu.register_with_engine(engine, shards)
 
-Tokens are addresses for Mooncake's bookkeeping only; they point at reserved,
+Fake addresses are for Mooncake's bookkeeping only; they point at reserved,
 inaccessible memory and must never be dereferenced.
 """
 
@@ -63,7 +63,7 @@ ADAPTER_LIB_NAME = "libmooncake_tpu_pjrt.so"
 class TpuShard:
     """One registered device buffer, e.g. one addressable shard of an array."""
 
-    token: int  # Address to register with the TransferEngine. Never deref.
+    fake_addr: int  # Address to register with the TransferEngine. Never deref.
     size: int  # Bytes of the buffer's on-device representation.
     device: int  # Local device ordinal; TENT records it as "tpu:<device>".
 
@@ -107,22 +107,22 @@ class TpuAdapter:
 
     def register(self, handle: int) -> TpuShard:
         """Registers a provider handle. The adapter owns it from now on."""
-        token = ctypes.c_uint64()
+        fake_addr = ctypes.c_uint64()
         size = ctypes.c_uint64()
         device = ctypes.c_int()
         rc = self._lib.mc_tpu_adapter_register(
-            handle, ctypes.byref(token), ctypes.byref(size), ctypes.byref(device)
+            handle, ctypes.byref(fake_addr), ctypes.byref(size), ctypes.byref(device)
         )
         if rc != 0:
             raise RuntimeError(
                 f"Mooncake TPU adapter could not register buffer handle {handle}; "
                 "see stderr for details"
             )
-        return TpuShard(token.value, size.value, device.value)
+        return TpuShard(fake_addr.value, size.value, device.value)
 
-    def unregister(self, token: int) -> None:
-        if self._lib.mc_tpu_adapter_unregister(token) != 0:
-            raise ValueError(f"unknown TPU buffer token {token:#x}")
+    def unregister(self, fake_addr: int) -> None:
+        if self._lib.mc_tpu_adapter_unregister(fake_addr) != 0:
+            raise ValueError(f"unknown TPU fake address {fake_addr:#x}")
 
     def release_buffer(self, handle: int) -> None:
         self._lib.mc_tpu_adapter_release_buffer(handle)
@@ -220,11 +220,11 @@ def unregister(
     """
     adapter = adapter if adapter is not None else get_adapter()
     for shard in shards:
-        adapter.unregister(shard.token)
+        adapter.unregister(shard.fake_addr)
 
 
 def register_with_engine(engine: Any, shards: Sequence[Sequence[TpuShard]]) -> None:
-    """Registers every shard's token with a TransferEngine.
+    """Registers every shard's fake address with a TransferEngine.
 
     Uses ``engine.batch_register_memory(addresses, capacities)``. The location
     is left to TENT, which asks the adapter and records "tpu:<device>".
@@ -233,7 +233,7 @@ def register_with_engine(engine: Any, shards: Sequence[Sequence[TpuShard]]) -> N
     if not flat:
         return
     rc = engine.batch_register_memory(
-        [shard.token for shard in flat], [shard.size for shard in flat]
+        [shard.fake_addr for shard in flat], [shard.size for shard in flat]
     )
     if rc != 0:
         raise RuntimeError(

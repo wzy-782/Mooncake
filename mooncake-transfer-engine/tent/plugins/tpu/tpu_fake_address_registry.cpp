@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_token_registry.h"
+#include "tpu_fake_address_registry.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -34,21 +34,21 @@ void tpuAdapterLog(const std::string &message) {
     std::fprintf(stderr, "[mooncake-tpu-adapter] %s\n", message.c_str());
 }
 
-TpuTokenRegistry::~TpuTokenRegistry() {
-    for (auto &[token, entry] : regions_) {
-        munmap(reinterpret_cast<void *>(token), entry.reserved_len);
+TpuFakeAddressRegistry::~TpuFakeAddressRegistry() {
+    for (auto &[fake_addr, entry] : regions_) {
+        munmap(reinterpret_cast<void *>(fake_addr), entry.reserved_len);
     }
 }
 
-TpuTokenRegistry &TpuTokenRegistry::instance() {
+TpuFakeAddressRegistry &TpuFakeAddressRegistry::instance() {
     // Leaked on purpose: TENT may call into the adapter from its own static
     // destructors, after this library's static objects would otherwise be
     // destroyed.
-    static TpuTokenRegistry *registry = new TpuTokenRegistry();
+    static TpuFakeAddressRegistry *registry = new TpuFakeAddressRegistry();
     return *registry;
 }
 
-uintptr_t TpuTokenRegistry::add(std::unique_ptr<DeviceRegion> region) {
+uintptr_t TpuFakeAddressRegistry::add(std::unique_ptr<DeviceRegion> region) {
     if (!region) {
         tpuAdapterLog("cannot register a null region");
         return 0;
@@ -81,33 +81,32 @@ uintptr_t TpuTokenRegistry::add(std::unique_ptr<DeviceRegion> region) {
     }
 
     const int numa = region->numaNode();
-    const auto token = reinterpret_cast<uintptr_t>(base);
+    const auto fake_addr = reinterpret_cast<uintptr_t>(base);
     std::unique_lock lock(mutex_);
-    regions_[token] = Entry{size, reserved_len,
-                            std::shared_ptr<DeviceRegion>(std::move(region))};
+    regions_[fake_addr] = Entry{
+        size, reserved_len, std::shared_ptr<DeviceRegion>(std::move(region))};
     auto [it, inserted] = device_numa_.emplace(device, numa);
     if (!inserted && it->second < 0) it->second = numa;
-    return token;
+    return fake_addr;
 }
 
-bool TpuTokenRegistry::remove(uintptr_t token) {
+bool TpuFakeAddressRegistry::remove(uintptr_t fake_addr) {
     Entry entry;
     {
         std::unique_lock lock(mutex_);
-        auto it = regions_.find(token);
+        auto it = regions_.find(fake_addr);
         if (it == regions_.end()) return false;
         entry = std::move(it->second);
         regions_.erase(it);
     }
     // Release the address range only once it is out of the map, so a lookup
     // can never resolve an address that has been returned to the kernel.
-    munmap(reinterpret_cast<void *>(token), entry.reserved_len);
+    munmap(reinterpret_cast<void *>(fake_addr), entry.reserved_len);
     return true;
 }
 
-std::shared_ptr<DeviceRegion> TpuTokenRegistry::resolve(const void *addr,
-                                                        size_t len,
-                                                        size_t *offset) const {
+std::shared_ptr<DeviceRegion> TpuFakeAddressRegistry::resolve(
+    const void *addr, size_t len, size_t *offset) const {
     const auto a = reinterpret_cast<uintptr_t>(addr);
     std::shared_lock lock(mutex_);
     auto it = regions_.upper_bound(a);
@@ -121,17 +120,17 @@ std::shared_ptr<DeviceRegion> TpuTokenRegistry::resolve(const void *addr,
     return it->second.region;
 }
 
-bool TpuTokenRegistry::contains(const void *addr) const {
+bool TpuFakeAddressRegistry::contains(const void *addr) const {
     return resolve(addr, 0, nullptr) != nullptr;
 }
 
-int TpuTokenRegistry::deviceIndex(const void *addr) const {
+int TpuFakeAddressRegistry::deviceIndex(const void *addr) const {
     auto region = resolve(addr, 0, nullptr);
     return region ? region->deviceIndex() : -1;
 }
 
-int TpuTokenRegistry::copyD2H(void *host_dst, const void *device_src,
-                              size_t len) const {
+int TpuFakeAddressRegistry::copyD2H(void *host_dst, const void *device_src,
+                                    size_t len) const {
     if (!host_dst || !device_src) return 1;
     size_t offset = 0;
     auto region = resolve(device_src, len, &offset);
@@ -144,8 +143,8 @@ int TpuTokenRegistry::copyD2H(void *host_dst, const void *device_src,
     return region->copyToHost(host_dst, offset, len) ? 0 : 1;
 }
 
-int TpuTokenRegistry::copyH2D(void *device_dst, const void *host_src,
-                              size_t len) const {
+int TpuFakeAddressRegistry::copyH2D(void *device_dst, const void *host_src,
+                                    size_t len) const {
     if (!device_dst || !host_src) return 1;
     size_t offset = 0;
     auto region = resolve(device_dst, len, &offset);
@@ -158,24 +157,24 @@ int TpuTokenRegistry::copyH2D(void *device_dst, const void *host_src,
     return region->copyFromHost(host_src, offset, len) ? 0 : 1;
 }
 
-int TpuTokenRegistry::deviceCount() const {
+int TpuFakeAddressRegistry::deviceCount() const {
     std::shared_lock lock(mutex_);
     return device_numa_.empty() ? 0 : device_numa_.rbegin()->first + 1;
 }
 
-int TpuTokenRegistry::deviceNuma(int index) const {
+int TpuFakeAddressRegistry::deviceNuma(int index) const {
     std::shared_lock lock(mutex_);
     auto it = device_numa_.find(index);
     return it == device_numa_.end() ? -1 : it->second;
 }
 
-size_t TpuTokenRegistry::regionSize(uintptr_t token) const {
+size_t TpuFakeAddressRegistry::regionSize(uintptr_t fake_addr) const {
     std::shared_lock lock(mutex_);
-    auto it = regions_.find(token);
+    auto it = regions_.find(fake_addr);
     return it == regions_.end() ? 0 : it->second.size;
 }
 
-size_t TpuTokenRegistry::size() const {
+size_t TpuFakeAddressRegistry::size() const {
     std::shared_lock lock(mutex_);
     return regions_.size();
 }
