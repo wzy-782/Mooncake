@@ -1,6 +1,7 @@
-# TENT Tests and Examples tent_metrics_example and deadline_promotion_bench are
-# not add_test targets. tent/benchmark/hip_bandwidth_bench.cpp is a standalone
-# hipcc program.
+# TENT Tests and Examples tent_metrics_example, deadline_promotion_bench and
+# tent_tpu_adapter_bench are not add_test targets.
+# tent/benchmark/hip_bandwidth_bench.cpp is a standalone hipcc program and
+# tent/benchmark/tpu_hbm_bench.py a standalone script for TPU VMs.
 
 add_executable(tent_diagnostic_test diagnostic_test.cpp)
 target_link_libraries(tent_diagnostic_test PRIVATE tent_diagnostics gtest
@@ -748,6 +749,95 @@ if(USE_TPU)
     tent_tpu_transport_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
+
+  # Fake-address registry of the built-in TPU adapter (tent/plugins/tpu). The
+  # registry's symbols are hidden in the adapter library, so the test compiles
+  # its source directly.
+  add_executable(
+    tent_tpu_fake_address_registry_test
+    tpu/tpu_fake_address_registry_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_fake_address_registry.cpp)
+  target_link_libraries(tent_tpu_fake_address_registry_test PRIVATE gtest
+                                                                    gtest_main)
+  target_include_directories(tent_tpu_fake_address_registry_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu)
+  add_test(NAME tent_tpu_fake_address_registry_test
+           COMMAND tent_tpu_fake_address_registry_test)
+
+  # Mock TPU buffer provider (tpu_buffer_provider.h) standing in for tpu-sync.
+  add_library(mock_tpu_buffer_provider SHARED tpu/mock_tpu_buffer_provider.cpp)
+  target_include_directories(mock_tpu_buffer_provider
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  # Built-in adapter end to end: provider binding, handle ownership, the
+  # mc_tpu_pjrt_* ABI, and TENT's real TpuPjrtShim loading the adapter.
+  add_executable(tent_tpu_pjrt_adapter_test tpu/tpu_pjrt_adapter_test.cpp)
+  add_dependencies(tent_tpu_pjrt_adapter_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_pjrt_adapter_test PRIVATE gtest gtest_main tent_link_group
+                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_pjrt_adapter_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_pjrt_adapter_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_pjrt_adapter_test COMMAND tent_tpu_pjrt_adapter_test)
+
+  # Built-in adapter under real engines: two TransferEngineImpls over loopback
+  # TCP stage registered fake addresses through the adapter and mock provider.
+  add_executable(tent_tpu_adapter_engine_test tpu/tpu_adapter_engine_test.cpp)
+  add_dependencies(tent_tpu_adapter_engine_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_adapter_engine_test PRIVATE gtest gtest_main tent_link_group
+                                         ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_engine_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_adapter_engine_test
+           COMMAND tent_tpu_adapter_engine_test)
+  set_tests_properties(tent_tpu_adapter_engine_test PROPERTIES TIMEOUT 300)
+
+  # Two exec'd processes, each with its own adapter registry: the peer's HBM
+  # staging must run in the peer, through the peer's adapter.
+  add_executable(tent_tpu_adapter_process_test tpu/tpu_adapter_process_test.cpp)
+  add_dependencies(tent_tpu_adapter_process_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(tent_tpu_adapter_process_test
+                        PRIVATE gtest tent_link_group ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_process_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_process_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_adapter_process_test
+           COMMAND tent_tpu_adapter_process_test)
+  set_tests_properties(tent_tpu_adapter_process_test PROPERTIES TIMEOUT 300)
+
+  # Manual microbenchmark of the adapter's Mooncake-side overhead (lookup, shim
+  # copies, staged engine transfers) against the mock provider; intentionally
+  # not registered with ctest.
+  add_executable(tent_tpu_adapter_bench tpu/tpu_adapter_bench.cpp)
+  add_dependencies(tent_tpu_adapter_bench tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(tent_tpu_adapter_bench PRIVATE tent_link_group
+                                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_bench
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_bench
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
 endif()
 
 # XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer
