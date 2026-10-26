@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -261,6 +262,52 @@ TEST_P(TpuEngineTest, StagesTpuToHostWrite) {
 
 TEST_P(TpuEngineTest, StagesHostToTpuRead) {
     transfer(false, true, Request::READ);
+}
+
+// A local TPU buffer needs this engine's TPU transport for its HBM<->host
+// hop. Without one the request fails, rather than reaching a host network
+// transport with the TPU address.
+TEST_P(TpuEngineTest, LocalTpuWithoutTpuTransportFailsCleanly) {
+    auto host_only = config();
+    host_only->set("transports/tpu/enable", false);
+    a_ = std::make_unique<TransferEngineImpl>(host_only);
+    ASSERT_TRUE(a_->available());
+    TransferEngineImplTestPeer::smallStagePool(*a_);
+    // The adapter is process-wide, so a_ still classifies this as TPU memory.
+    void* local = register_(kLength, /*index=*/0);
+    ASSERT_NE(local, nullptr);
+    MemoryOptions opts;
+    if (hpTcp()) {
+        // HP TCP serves host memory only, so nothing can register the buffer.
+        EXPECT_FALSE(a_->registerLocalMemory({local}, {kLength}, opts).ok());
+        return;
+    }
+    ASSERT_TRUE(a_->registerLocalMemory({local}, {kLength}, opts).ok());
+    registrations_.push_back({a_.get(), local});
+    std::memset(device_data_(local), 0x5A, kLength);
+    uint8_t* peer_data = nullptr;
+    for (bool peer_tpu : {true, false}) {
+        SCOPED_TRACE(peer_tpu ? "peer TPU" : "peer host");
+        void* peer = buffer(*b_, peer_tpu, &peer_data);
+        ASSERT_NE(peer, nullptr);
+        std::memset(peer_data, 0, kLength);
+        for (auto opcode : {Request::WRITE, Request::READ}) {
+            EXPECT_EQ(TransferEngineImplTestPeer::route(
+                          *a_, request(opcode, local, peer))
+                          .transport,
+                      UNSPEC);
+        }
+        auto batch = a_->allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        ASSERT_TRUE(
+            a_->submitTransfer(batch, {request(Request::WRITE, local, peer)})
+                .ok());
+        EXPECT_EQ(wait(batch).s, FAILED);
+        EXPECT_TRUE(a_->freeBatch(batch).ok());
+        EXPECT_EQ(std::count(peer_data, peer_data + kLength, 0),
+                  static_cast<long>(kLength))
+            << "peer bytes changed";
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(

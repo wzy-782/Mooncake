@@ -49,7 +49,8 @@ Follow one transfer from the top:
    `[server, local_stage_location, remote_stage_location]`; empty entries mean
    "no staging on that side". The network hop is then selected only among
    host-to-host transports (RDMA, FABRIC, TCP, HP TCP), and the plan travels
-   with the route:
+   with the route. A local TPU side needs the local `TpuTransport`; a peer's
+   TPU side is staged by the peer, so a host-only initiator needs none:
    ```cpp
    owner.staging = !owner.staging_params.empty() && staging_proxy_;
    ```

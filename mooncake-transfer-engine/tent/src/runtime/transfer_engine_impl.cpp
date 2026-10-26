@@ -1547,8 +1547,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
-        if ((transport_list_[TPU] &&
-             (local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU)) ||
+        if (local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU ||
             (transport_list_[XPU] &&
              (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
@@ -2017,11 +2016,11 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // through host DRAM: the device's copy transport (TpuTransport,
     // XpuTransport, MluTransport) runs the local device<->host hop and a host
     // network transport carries the host<->host hop. The local device needs its
-    // copy transport; a host-only caller can delegate a peer's MLU copy to that
-    // peer. Each device side needs a resolvable host stage. Fail closed when
-    // topology or the local copy transport is unavailable.
-    if (((transport_list_[TPU] &&
-          (local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU)) ||
+    // copy transport; a host-only caller can delegate a peer's TPU or MLU copy
+    // to that peer. Each device side needs a resolvable host stage. Fail closed
+    // when topology or the local copy transport is unavailable.
+    if ((((local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU) &&
+          (local_mtype != MTYPE_TPU || transport_list_[TPU])) ||
          (transport_list_[XPU] &&
           (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
          ((local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) &&

@@ -35,6 +35,11 @@ The staging policy that ties these together is planned in
 `TransferEngineImpl::getTransportType` (before transport selection) using the
 shared TPU/XPU/MLU case in `TransferEngineImpl::findStagingPolicy`.
 
+Each process copies only its own HBM. The initiator stages its local TPU side
+through its `TpuTransport` and delegates the peer's TPU side to the peer, so a
+host-only initiator, even one built without `USE_TPU`, can read and write a
+peer's TPU memory. A local TPU side without a local `TpuTransport` is refused.
+
 ## The device-copy adapter (runtime dependency)
 
 `TpuPjrtShim` does **not** link the PJRT runtime. Instead it loads an adapter
