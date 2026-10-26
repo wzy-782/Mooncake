@@ -923,8 +923,9 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
-    // Prefer XPU/MLU local copies over TCP's device-copy fallback. Neither
+    // Prefer TPU/XPU/MLU local copies over TCP's device-copy fallback. None
     // advertises host-to-host capability, so host network order is intact.
+    if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[XPU]) result.push_back(XPU);
     if (transport_list_[MLU]) result.push_back(MLU);
     if (transport_list_[RDMA]) result.push_back(RDMA);
@@ -937,7 +938,6 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[HP_TCP]) result.push_back(HP_TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
-    if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[HYLINK]) result.push_back(HYLINK);
     if (transport_list_[MEMFABRIC]) result.push_back(MEMFABRIC);
     return result;
@@ -1723,6 +1723,7 @@ struct TransferEngineImpl::PreparedSubmit {
         SelectionResult route{};
         bool staging{false};
         std::vector<std::string> staging_params;
+        std::shared_ptr<const StagedRoute> staged_route;
     };
 
     std::chrono::steady_clock::time_point submit_time{};
@@ -2064,9 +2065,35 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
     return result;
 }
 
+SelectionResult TransferEngineImpl::resolveRoute(const Request& req,
+                                                 const StagedRoute* staged,
+                                                 int transport_index) {
+    if (!staged) return resolveTransport(req, transport_index);
+    // A host-to-host hop of a staged request is routed as the staged request:
+    // its hint, policy, devices and QP pool, and only its candidates to fail
+    // over to, starting from the one the staged request is on.
+    auto route = resolveTransport(staged->request,
+                                  staged->transport_index + transport_index);
+    // Without staging, the route is not one for a host-to-host hop.
+    if (route.staging_params.empty()) return SelectionResult{};
+    route.staging_params.clear();
+    return route;
+}
+
+std::shared_ptr<const StagedRoute> TransferEngineImpl::hopRoute(
+    const SelectionResult& route, const Request& request, int transport_index) {
+    // Staging planned with the route chose a network transport for the hops.
+    // Staging added afterwards (findStagingPolicy for a transport picked for
+    // the device memory itself) leaves each hop to route by itself.
+    if (route.staging_params.empty()) return nullptr;
+    return std::make_shared<const StagedRoute>(
+        StagedRoute{request, transport_index});
+}
+
 Status TransferEngineImpl::prepareSubmit(
     Batch* batch, const std::vector<Request>& request_list,
-    PreparedSubmit& prepared, bool require_post_submit_cancellation) {
+    PreparedSubmit& prepared, bool require_post_submit_cancellation,
+    std::shared_ptr<const StagedRoute> staged_route) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
     for (size_t i = 0; i < request_list.size(); ++i) {
         auto st = validateTransportHint(request_list[i], i);
@@ -2135,7 +2162,8 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
         owner.request = request;
-        owner.route = resolveTransport(owner.request, 0);
+        owner.staged_route = staged_route;
+        owner.route = resolveRoute(owner.request, staged_route.get(), 0);
         if (require_post_submit_cancellation) {
             const auto type = owner.route.transport;
             if (type == UNSPEC || type < 0 ||
@@ -2234,6 +2262,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = merged_request;
+        task.staged_route = owner.staged_route;
         task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time =
@@ -2258,8 +2287,9 @@ Status TransferEngineImpl::commitPreparedSubmit(
             // Transport::submitTransferTasks() calls, which are counted where
             // they recurse through the non-staging path below. Only stamp the
             // logical request's first post time for stage decomposition here.
-            auto status = staging_proxy_->submit(&task, (BatchID)batch,
-                                                 owner.staging_params);
+            auto status = staging_proxy_->submit(
+                &task, (BatchID)batch, owner.staging_params,
+                hopRoute(owner.route, task.request, task.xport_priority));
             if (!status.ok()) {
                 task.staging = false;
                 task.type = UNSPEC;
@@ -2428,9 +2458,12 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         // prediction is a pre-dispatch heuristic, and re-scoring an admitted
         // owner would let the drop decision change underneath it.
         input.transport = owner.route.transport;
+        // A hop of a staged request carries the request's deadline to order
+        // it, but must not be dropped: the staged request is already under
+        // way, and losing one hop would fail it part-way.
         input.degradation_eligible =
             (owner.route.transport == RDMA || owner.route.transport == UB) &&
-            !owner.staging;
+            !owner.staging && !owner.staged_route;
         submit.owners.push_back(std::move(input));
     }
 
@@ -2448,6 +2481,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = owner.request;
+        task.staged_route = owner.staged_route;
         task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time = prepared.submit_time;
@@ -2591,7 +2625,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto* batch = queued.batch;
     auto& task = batch->task_list[queued.owner_task_id];
     task.dispatch_time = std::chrono::steady_clock::now();
-    auto route = resolveTransport(task.request, 0);
+    auto route = resolveRoute(task.request, task.staged_route.get(), 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
     task.qp_pool = route.qp_pool.value_or("");
@@ -2609,8 +2643,9 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             // Orchestration only; the real transport submissions issued by
             // ProxyManager are counted where they recurse through the
             // non-staging path below.
-            auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
+            auto status = staging_proxy_->submit(
+                &task, (BatchID)batch, staging_params,
+                hopRoute(route, task.request, task.xport_priority));
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
             task.post_time = std::chrono::steady_clock::now();
             return markQueuedOwnerSubmitted(owner_id);
@@ -2748,14 +2783,16 @@ bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind,
-    bool require_post_submit_cancellation) {
+    bool require_post_submit_cancellation,
+    std::shared_ptr<const StagedRoute> staged_route) {
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
     const size_t start_task_id = batch_ref.get()->task_list.size();
     PreparedSubmit prepared;
     CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
-                               require_post_submit_cancellation));
+                               require_post_submit_cancellation,
+                               std::move(staged_route)));
 
     if (shouldQueueSubmit(prepared, owner_kind)) {
         CHECK_STATUS(
@@ -2789,9 +2826,11 @@ Status TransferEngineImpl::submitTransferRequiringPostSubmitCancellation(
 }
 
 Status TransferEngineImpl::submitStagingTransfer(
-    BatchID batch_id, const std::vector<Request>& request_list) {
+    BatchID batch_id, const std::vector<Request>& request_list,
+    std::shared_ptr<const StagedRoute> staged_route) {
     return submitTransfer(batch_id, request_list, nullptr,
-                          QueueOwnerKind::StagingInternal);
+                          QueueOwnerKind::StagingInternal, false,
+                          std::move(staged_route));
 }
 
 void TransferEngineImpl::addSubmitHook(Batch* batch, size_t start_task_id,
@@ -2956,7 +2995,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     else
         task.xport_priority = task.failover_count;
 
-    auto result = resolveTransport(task.request, task.xport_priority);
+    auto result = resolveRoute(task.request, task.staged_route.get(),
+                               task.xport_priority);
     auto type = result.transport;
     if (type == UNSPEC) {
         VLOG(1) << "No more transports available after "
@@ -2984,8 +3024,9 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         task.device_mask = result.device_mask;
         task.qp_pool = result.qp_pool.value_or("");
         task.staging = true;
-        return staging_proxy_->submit(&task, (BatchID)batch,
-                                      result.staging_params);
+        return staging_proxy_->submit(
+            &task, (BatchID)batch, result.staging_params,
+            hopRoute(result, task.request, task.xport_priority));
     }
 
     auto& transport = transport_list_[type];
@@ -3739,8 +3780,10 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
             // the transfer was submitted) is independent of whether the
             // transfer ultimately completed or failed, so it is recorded for
             // both outcomes. The feasible MLU ratio requires the actual
-            // transfer latency, so it is only recorded on COMPLETED.
-            if (task.request.deadline_ns != 0) {
+            // transfer latency, so it is only recorded on COMPLETED. The hops
+            // of a staged request carry its deadline, but only the staged
+            // request itself is recorded.
+            if (task.request.deadline_ns != 0 && !task.staged_route) {
                 uint64_t start_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         start_time.time_since_epoch())

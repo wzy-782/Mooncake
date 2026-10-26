@@ -751,6 +751,20 @@ if(USE_TPU)
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_engine_test COMMAND tent_tpu_engine_test)
   set_tests_properties(tent_tpu_engine_test PROPERTIES TIMEOUT 300)
+
+  # The route chosen for a staged TPU request must carry all of its chunks.
+  add_executable(tent_tpu_staged_route_test tpu/tpu_staged_route_test.cpp)
+  add_dependencies(tent_tpu_staged_route_test mock_tpu_pjrt)
+  target_link_libraries(
+    tent_tpu_staged_route_test PRIVATE gtest gtest_main tent_link_group
+                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_staged_route_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_staged_route_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_staged_route_test COMMAND tent_tpu_staged_route_test)
+  set_tests_properties(tent_tpu_staged_route_test PROPERTIES TIMEOUT 300)
 endif()
 
 # A host-only initiator against a peer process that owns TPU memory. The peer

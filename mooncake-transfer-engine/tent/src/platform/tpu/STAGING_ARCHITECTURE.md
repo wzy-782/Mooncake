@@ -79,6 +79,12 @@ Follow one transfer from the top:
    ```cpp
    status = Platform::getLoader().copy(dst, src, length);  // :122 / :126
    ```
+   The host-to-host hop is the exception: `submitCrossStage` passes the staged
+   request's route (`StagedRoute`), so each chunk keeps the request's transport
+   hint, policy, QP pool, scheduling metadata and failover candidates instead
+   of being selected afresh as a small host-to-host transfer. For the
+   HBM↔host stages, `TpuTransport` is listed ahead of the network transports
+   on every buffer, so it wins over TCP's device-copy fallback.
 
 So the real device-copy seam is **`Platform::copy`**
 (`CudaPlatform::copy` does `cudaMemcpyAsync`; `TpuPlatform::copy` will call the
