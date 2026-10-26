@@ -450,6 +450,34 @@ Fake addresses are for Mooncake's bookkeeping only and must never be
 dereferenced. Byte offsets within a fake address index the buffer's on-device layout,
 so both ends of a transfer must use identical shapes, dtypes and shardings.
 
+A provider may accept only some device offsets. tpu-sync accepts offsets that
+are multiples of 32 bytes, with any length and any host buffer, so with
+tpu-sync each TPU side of a transfer must start at a 32-byte-aligned offset.
+TENT stages a transfer in chunks that start multiples of 4 MiB after that
+offset, so the chunks stay aligned. A transfer at an offset the provider
+rejects fails; Mooncake never rounds the offset, which would also copy
+neighboring bytes.
+
+**Lifecycle:**
+
+1. Register the arrays with the adapter (`tpu.prepare`) before creating the
+   `TransferEngine`.
+2. Register the returned fake addresses with the engine
+   (`tpu.register_with_engine`).
+3. While a transfer may use an array, do not write to it from the framework or
+   donate it: the provider's copies are not ordered with framework
+   computations.
+4. Wait for every transfer that uses a buffer to finish before unregistering
+   it.
+5. Unregister the fake addresses from the engine first, then from the adapter,
+   and only then shut down the framework runtime that owns the device memory:
+
+```python
+flat = [shard for per_array in shards for shard in per_array]
+engine.batch_unregister_memory([shard.fake_addr for shard in flat])
+tpu.unregister(flat)  # The adapter then releases the provider handles.
+```
+
 **Design notes:**
 - TPU memory is reported as a distinct memory type (`tpu:N` locations); the
   staging policy routes the local HBM ↔ host copy to the TPU device-copy

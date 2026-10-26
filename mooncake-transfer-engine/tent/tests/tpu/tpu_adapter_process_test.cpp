@@ -77,6 +77,8 @@ class TransferEngineImplTestPeer {
 namespace tent {
 namespace {
 constexpr size_t kSize = (8UL << 20) + 4096;
+// Not a multiple of 32: the mock provider accepts any offset here. tpu-sync's
+// alignment rule is covered by tpu_adapter_engine_test.
 constexpr size_t kOffset = 17;
 constexpr int kHost = 0, kTpu = 1;  // Buffer indices.
 

@@ -15,7 +15,8 @@
 // Mock TPU buffer provider (tpu_buffer_provider.h) for testing Mooncake's
 // built-in TPU adapter without TPU hardware or a real provider such as
 // tpu-sync. Buffers are plain host memory; test-only helpers create them and
-// expose their bytes and lifetime counters.
+// expose their bytes and lifetime counters. Copies accept any offset unless a
+// test imposes a device-offset alignment, as tpu-sync does.
 
 #include <atomic>
 #include <cstdint>
@@ -40,10 +41,20 @@ std::map<mc_tpu_buffer_t, std::unique_ptr<Buffer>> g_buffers;
 mc_tpu_buffer_t g_next_handle = 1;
 std::atomic<int> g_released{0};
 std::atomic<bool> g_fail_copies{false};
+std::atomic<size_t> g_device_alignment{0};  // 0: any offset
+std::atomic<int> g_rejected{0};
 
 Buffer *findLocked(mc_tpu_buffer_t handle) {
     auto it = g_buffers.find(handle);
     return it == g_buffers.end() ? nullptr : it->second.get();
+}
+
+// Whether a copy at `offset` breaks the configured alignment rule.
+bool rejectOffset(size_t offset) {
+    const size_t alignment = g_device_alignment;
+    if (alignment == 0 || offset % alignment == 0) return false;
+    ++g_rejected;
+    return true;
 }
 
 size_t mockSize(mc_tpu_buffer_t handle) {
@@ -66,7 +77,7 @@ int mockNuma(mc_tpu_buffer_t handle) {
 
 int mockCopyToHost(mc_tpu_buffer_t handle, size_t offset, void *dst,
                    size_t len) {
-    if (g_fail_copies) return 1;
+    if (g_fail_copies || rejectOffset(offset)) return 1;
     std::lock_guard<std::mutex> lock(g_mutex);
     Buffer *b = findLocked(handle);
     if (!b || offset > b->data.size() || len > b->data.size() - offset) {
@@ -78,7 +89,7 @@ int mockCopyToHost(mc_tpu_buffer_t handle, size_t offset, void *dst,
 
 int mockCopyFromHost(mc_tpu_buffer_t handle, size_t offset, const void *src,
                      size_t len) {
-    if (g_fail_copies) return 1;
+    if (g_fail_copies || rejectOffset(offset)) return 1;
     std::lock_guard<std::mutex> lock(g_mutex);
     Buffer *b = findLocked(handle);
     if (!b || offset > b->data.size() || len > b->data.size() - offset) {
@@ -145,5 +156,15 @@ int mock_provider_live_count(void) {
 int mock_provider_released_count(void) { return g_released; }
 
 void mock_provider_set_fail_copies(int fail) { g_fail_copies = fail != 0; }
+
+// Makes copies fail, without touching any byte, unless the device offset is a
+// multiple of `alignment`, the way tpu-sync rejects offsets that are not
+// multiples of 32. 0, the default, accepts any offset.
+void mock_provider_set_device_alignment(size_t alignment) {
+    g_device_alignment = alignment;
+}
+
+// Copies refused by the alignment rule so far.
+int mock_provider_rejected_count(void) { return g_rejected; }
 
 }  // extern "C"

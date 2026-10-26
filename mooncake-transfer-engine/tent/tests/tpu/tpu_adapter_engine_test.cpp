@@ -76,6 +76,10 @@ constexpr size_t kChunk = 1UL << 20;    // smallStagePool() slot size
 // Longer than the whole four-slot staging pool, and not chunk aligned.
 constexpr size_t kLength = 4 * kChunk + 4096 + 3;
 constexpr uint8_t kGuard = 0xEE;
+// tpu-sync accepts device offsets that are multiples of 32 bytes only; lengths
+// and host offsets are free. The mock provider accepts any offset unless a
+// test imposes this rule.
+constexpr size_t kTpuSyncAlignment = 32;
 
 std::vector<uint8_t> pattern(size_t size, int seed) {
     std::vector<uint8_t> result(size);
@@ -148,6 +152,7 @@ class TpuAdapterEngineTest : public ::testing::TestWithParam<Params> {
 
     void TearDown() override {
         env().setFailCopies(false);
+        env().setDeviceAlignment(0);
         // Stop staging while transports and registrations are still alive.
         for (auto* engine : {a_.get(), b_.get()}) {
             if (!engine) continue;
@@ -296,6 +301,22 @@ class TpuAdapterEngineTest : public ::testing::TestWithParam<Params> {
         EXPECT_TRUE(idle) << "batches and staging slots did not drain";
     }
 
+    // A transfer at a device offset the provider refuses fails and leaves the
+    // destination untouched: the offset is never rounded to an accepted one,
+    // which would copy bytes outside the requested range. The same buffers
+    // then copy normally, and every batch and staging slot is released.
+    void expectRejected(Request::OpCode opcode, const Side& local,
+                        size_t local_off, const Side& peer, size_t peer_off) {
+        SCOPED_TRACE(opcode == Request::WRITE ? "WRITE" : "READ");
+        constexpr size_t length = 2 * kChunk + 5;  // Several staging chunks.
+        const int rejected = env().rejectedCount();
+        ASSERT_NO_FATAL_FAILURE(
+            transfer(opcode, local, local_off, peer, peer_off, length, FAILED));
+        EXPECT_GT(env().rejectedCount(), rejected);
+        ASSERT_NO_FATAL_FAILURE(transfer(opcode, local, 0, peer, 0, length));
+        expectIdle();
+    }
+
     static inline std::string load_error_;
     static inline MockTpuBuffer anchors_[2];
 
@@ -358,7 +379,10 @@ TEST_P(TpuAdapterEngineTest, StagesOneTpuSideWriteAndRead) {
     }
 }
 
-TEST_P(TpuAdapterEngineTest, CopiesInteriorRangesAndLeavesTheRestUntouched) {
+// The adapter itself accepts any byte offset, so with a permissive provider
+// arbitrary interior ranges copy. Providers may restrict device offsets; the
+// TpuSync* tests below cover tpu-sync's rule.
+TEST_P(TpuAdapterEngineTest, PermissiveProviderCopiesUnalignedInteriorRanges) {
     constexpr size_t kSize = kLength + 8192;
     Side local = tpu(*a_, kSize);
     Side peer = tpu(*b_, kSize);
@@ -366,6 +390,45 @@ TEST_P(TpuAdapterEngineTest, CopiesInteriorRangesAndLeavesTheRestUntouched) {
         SCOPED_TRACE(::testing::Message() << "length=" << length);
         roundTrip(local, peer, length, /*local_off=*/17, /*peer_off=*/4093);
     }
+}
+
+// With tpu-sync's rule, ranges starting at aligned device offsets copy
+// exactly, whatever their length. A range spanning several staging chunks
+// stays valid because each chunk starts a multiple of the chunk size later.
+TEST_P(TpuAdapterEngineTest, TpuSyncAlignedRangesCopyExactly) {
+    env().setDeviceAlignment(kTpuSyncAlignment);
+    const int rejected = env().rejectedCount();
+    constexpr size_t kSize = kLength + 8192;
+    Side local = tpu(*a_, kSize);
+    Side peer = tpu(*b_, kSize);
+    Side cpu = host(*a_, kSize);
+    for (size_t length :
+         {size_t(1), size_t(33), size_t(65539), 2 * kChunk + 5, kLength}) {
+        SCOPED_TRACE(::testing::Message() << "length=" << length);
+        roundTrip(local, peer, length, /*local_off=*/4096 + 32,
+                  /*peer_off=*/96);
+        // Only device offsets are constrained; a host side may start anywhere.
+        roundTrip(cpu, peer, length, /*local_off=*/17, /*peer_off=*/96);
+    }
+    EXPECT_EQ(env().rejectedCount(), rejected);
+}
+
+// WRITE reads the local buffer and READ the peer's, so between them these
+// cover a misaligned source in both the local and the delegated remote stage.
+TEST_P(TpuAdapterEngineTest, TpuSyncMisalignedSourceOffsetFails) {
+    env().setDeviceAlignment(kTpuSyncAlignment);
+    Side local = tpu(*a_, kLength);
+    Side peer = tpu(*b_, kLength);
+    expectRejected(Request::WRITE, local, /*local_off=*/17, peer, 0);
+    expectRejected(Request::READ, local, 0, peer, /*peer_off=*/17);
+}
+
+TEST_P(TpuAdapterEngineTest, TpuSyncMisalignedDestinationOffsetFails) {
+    env().setDeviceAlignment(kTpuSyncAlignment);
+    Side local = tpu(*a_, kLength);
+    Side peer = tpu(*b_, kLength);
+    expectRejected(Request::WRITE, local, 0, peer, /*peer_off=*/17);
+    expectRejected(Request::READ, local, /*local_off=*/17, peer, 0);
 }
 
 TEST_P(TpuAdapterEngineTest, RoutesEachBufferToItsOwnDevice) {
@@ -376,6 +439,7 @@ TEST_P(TpuAdapterEngineTest, RoutesEachBufferToItsOwnDevice) {
 TEST_P(TpuAdapterEngineTest, BatchOfRequestsAcrossManyBuffers) {
     constexpr int kBuffers = 4;
     constexpr int kPerBuffer = 4;
+    // Odd slice offsets: this relies on the permissive provider.
     constexpr size_t kSlice = 200 * 1024 + 7;
     constexpr size_t kSize = kPerBuffer * (kSlice + 64);
     std::vector<Side> local, peer;

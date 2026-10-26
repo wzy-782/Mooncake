@@ -69,7 +69,11 @@ typedef struct mc_tpu_buffer_provider {
     int (*numa_node)(mc_tpu_buffer_t buffer);
 
     // Blocking copies of bytes [offset, offset + len) of the buffer to/from
-    // host memory. The adapter guarantees the range lies inside the buffer.
+    // host memory. The adapter guarantees the range lies inside the buffer
+    // and passes `offset` and `len` through unchanged: it never rounds or
+    // widens a range. A provider may accept only some offsets (tpu-sync
+    // requires multiples of 32 bytes, with any length and host pointer) and
+    // must fail the others without copying; TENT then fails the transfer.
     // Return 0 on success, non-zero on failure.
     int (*copy_to_host)(mc_tpu_buffer_t buffer, size_t offset, void *host_dst,
                         size_t len);

@@ -80,8 +80,13 @@ class MockTpuEnv {
         live_count_ = sym<int (*)()>(provider, "mock_provider_live_count");
         set_fail_copies_ =
             sym<void (*)(int)>(provider, "mock_provider_set_fail_copies");
+        set_device_alignment_ = sym<void (*)(size_t)>(
+            provider, "mock_provider_set_device_alignment");
+        rejected_count_ =
+            sym<int (*)()>(provider, "mock_provider_rejected_count");
         if (!load_provider_ || !register_ || !unregister_ || !create_ ||
-            !data_ || !live_count_ || !set_fail_copies_) {
+            !data_ || !live_count_ || !set_fail_copies_ ||
+            !set_device_alignment_ || !rejected_count_) {
             *error = "adapter or mock provider is missing a symbol";
             return false;
         }
@@ -119,6 +124,12 @@ class MockTpuEnv {
 
     int liveCount() const { return live_count_(); }
     void setFailCopies(bool fail) { set_fail_copies_(fail ? 1 : 0); }
+    // Copies at device offsets that are not multiples of `alignment` fail;
+    // 0 accepts any offset. tpu-sync requires 32.
+    void setDeviceAlignment(size_t alignment) {
+        set_device_alignment_(alignment);
+    }
+    int rejectedCount() const { return rejected_count_(); }
 
    private:
     template <typename Fn>
@@ -134,6 +145,8 @@ class MockTpuEnv {
     uint8_t *(*data_)(uint64_t) = nullptr;
     int (*live_count_)() = nullptr;
     void (*set_fail_copies_)(int) = nullptr;
+    void (*set_device_alignment_)(size_t) = nullptr;
+    int (*rejected_count_)() = nullptr;
 };
 
 }  // namespace tent
