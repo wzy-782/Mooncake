@@ -315,6 +315,10 @@ class TpuStagedRouteTest : public ::testing::TestWithParam<Params> {
                 TransferEngineImplTestPeer::transport(*a_, type));
             a_->swapTransportForTest(type, recorders_[type]);
         }
+        // The peer runs the HBM<->host copies of delegated stages.
+        peer_tpu_ = std::make_shared<RecordingTransport>(
+            TransferEngineImplTestPeer::transport(*b_, TPU));
+        b_->swapTransportForTest(TPU, peer_tpu_);
         local_ = tpu(*a_);
         remote_ = tpu(*b_);
         ASSERT_TRUE(a_->openSegment(peer_, b_->getSegmentName()).ok());
@@ -402,6 +406,7 @@ class TpuStagedRouteTest : public ::testing::TestWithParam<Params> {
     std::unique_ptr<TransferEngineImpl> a_, b_;
     std::array<std::shared_ptr<RecordingTransport>, kSupportedTransportTypes>
         recorders_;
+    std::shared_ptr<RecordingTransport> peer_tpu_;
     std::vector<std::pair<TransferEngineImpl*, void*>> registrations_;
     void* local_ = nullptr;
     void* remote_ = nullptr;
@@ -523,6 +528,24 @@ TEST_P(TpuStagedRouteTest, LocalHbmCopiesStayOnTheTpuTransport) {
         EXPECT_EQ(Platform::getLoader().getMemoryType(copy.request.source),
                   MTYPE_TPU);
     }
+    for (const auto& chunk : submitted(TCP)) {
+        auto* target = reinterpret_cast<void*>(chunk.request.target_offset);
+        EXPECT_NE(Platform::getLoader().getMemoryType(chunk.request.source),
+                  MTYPE_TPU);
+        EXPECT_NE(Platform::getLoader().getMemoryType(target), MTYPE_TPU);
+    }
+}
+
+// protocol="tcp" sets force_tcp, which pins the network hop to TCP. The
+// HBM<->host copies are not network hops: on both engines they stay on the
+// TPU transport rather than going through TCP to the engine's own server.
+TEST_P(TpuStagedRouteTest, ForcedTcpKeepsLocalHbmCopiesOnTheTpuTransport) {
+    ASSERT_NO_FATAL_FAILURE(start(TCP, {{"transports/force_tcp", true}}));
+    for (auto opcode : {Request::WRITE, Request::READ})
+        EXPECT_EQ(transfer(request(opcode)), COMPLETED);
+    expectChunksOnlyOn(TCP, 2);
+    EXPECT_EQ(submitted(TPU).size(), 2 * kChunks);
+    EXPECT_EQ(peer_tpu_->submissions().size(), 2 * kChunks);
     for (const auto& chunk : submitted(TCP)) {
         auto* target = reinterpret_cast<void*>(chunk.request.target_offset);
         EXPECT_NE(Platform::getLoader().getMemoryType(chunk.request.source),

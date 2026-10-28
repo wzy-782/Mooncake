@@ -231,6 +231,54 @@ TEST(TransportSelectorTest, ForceTcpDoesNotOverrideFileTransportPolicy) {
     EXPECT_EQ(selector.select(ctx, transports).transport, GDS);
 }
 
+// force_tcp pins memory transfers to TCP, but a local HBM<->host copy is not a
+// network hop. TCP claims device capabilities on a TPU platform, so without
+// the exemption it carried the copy, through an RPC to the engine's own
+// server, instead of TpuTransport.
+TEST(TransportSelectorTest, ForceTcpKeepsLocalTpuCopiesOnTheTpuTransport) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {TPU, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        auto* fake = static_cast<FakeTransport*>(transports[type].get());
+        fake->setGpuToDram(true);
+        fake->setDramToGpu(true);
+        fake->setDramToDram(type == TCP);
+    }
+
+    // The buffer's own order does not matter: force_tcp ignores it.
+    std::vector<TransportType> buffer_transports = {TCP, TPU};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_TPU;  // HBM -> host stage
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TPU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, UNSPEC);
+
+    ctx.local_memory_type = MTYPE_CPU;  // host stage -> HBM
+    ctx.remote_memory_type = MTYPE_TPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TPU);
+
+    // Local host copies and network hops stay on TCP.
+    ctx.remote_memory_type = MTYPE_CPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+    ctx.local_segment = false;
+    ctx.same_machine = false;
+    ctx.host_staging = true;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_TPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+}
+
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------
