@@ -194,6 +194,9 @@ class HighPerformanceTcpServer::Session
         auto self = shared_from_this();
         asio::async_write(
             *socket_, asio::buffer(remoteDataAt(body_offset_), chunk),
+            [chunk](const std::error_code& error, size_t sent) -> size_t {
+                return error ? 0 : chunk - sent;
+            },
             [self, chunk](const std::error_code& error, size_t bytes) {
                 self->runHandler([&] {
                     if (self->forced_close_) {
@@ -226,6 +229,9 @@ class HighPerformanceTcpServer::Session
         auto self = shared_from_this();
         asio::async_read(
             *socket_, asio::buffer(remoteDataAt(body_offset_), chunk),
+            [chunk](const std::error_code& error, size_t received) -> size_t {
+                return error ? 0 : chunk - received;
+            },
             [self, chunk](const std::error_code& error, size_t bytes) {
                 self->runHandler([&] {
                     if (self->forced_close_) {
