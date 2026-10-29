@@ -76,6 +76,7 @@ struct LogicalTransferRuntimePolicy {
 struct StagedRoute {
     Request request;         // The staged request.
     int transport_index{0};  // Its current candidate; hops fail over from it.
+    SelectionResult route;   // Its route at that candidate, without staging.
 };
 
 struct TaskInfo {
@@ -552,8 +553,8 @@ class TransferEngineImpl {
                                      bool invalidate_on_fail = true);
 
     // resolveTransport for `req`, or, for a host-to-host hop of a staged
-    // request, the staged request's route at `transport_index` past its
-    // current candidate.
+    // request, the staged request's route: the one it is on for
+    // `transport_index` 0, else its candidate `transport_index` past that.
     SelectionResult resolveRoute(const Request& req, const StagedRoute* staged,
                                  int transport_index);
 

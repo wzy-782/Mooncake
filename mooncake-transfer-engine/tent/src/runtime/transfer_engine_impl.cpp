@@ -2235,7 +2235,10 @@ SelectionResult TransferEngineImpl::resolveRoute(const Request& req,
     if (!staged) return resolveTransport(req, transport_index);
     // A host-to-host hop of a staged request is routed as the staged request:
     // its hint, policy, devices and QP pool, and only its candidates to fail
-    // over to, starting from the one the staged request is on.
+    // over to. A hop starts on the route the staged request is on, as chosen
+    // when the request was planned: planning it again, on a ProxyManager
+    // thread with its own segment cache, could reach another answer.
+    if (transport_index == 0) return staged->route;
     auto route = resolveTransport(staged->request,
                                   staged->transport_index + transport_index);
     // Without staging, the route is not one for a host-to-host hop.
@@ -2250,8 +2253,10 @@ std::shared_ptr<const StagedRoute> TransferEngineImpl::hopRoute(
     // Staging added afterwards (findStagingPolicy for a transport picked for
     // the device memory itself) leaves each hop to route by itself.
     if (route.staging_params.empty()) return nullptr;
+    auto hop = route;
+    hop.staging_params.clear();
     return std::make_shared<const StagedRoute>(
-        StagedRoute{request, transport_index});
+        StagedRoute{request, transport_index, std::move(hop)});
 }
 
 Status TransferEngineImpl::prepareSubmit(
