@@ -578,8 +578,16 @@ SelectionResult TransportSelector::select(
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
+    // force_tcp restricts memory transfers to TCP, its one network transport.
+    // A local HBM<->host copy is not a network hop: TpuTransport may still
+    // carry it, ahead of TCP's fallback copy through an RPC to this engine.
+    static const std::vector<TransportType> kTpuThenTcp{TPU, TCP};
+    const bool local_tpu_copy =
+        context.local_segment && (context.local_memory_type == MTYPE_TPU ||
+                                  context.remote_memory_type == MTYPE_TPU);
+    const auto& forced = local_tpu_copy ? kTpuThenTcp : kTcpOnly;
     const auto& raw =
-        force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        force_tcp_ && context.segment_type == SegmentType::Memory ? forced
         : !matching_policy->transports.empty() ? matching_policy->transports
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;

@@ -845,6 +845,60 @@ if(USE_TPU)
     PRIVATE
       TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
       MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+
+  # Two engines over loopback: TPU requests must be planned as host-staged
+  # transfers whichever host network transport is installed.
+  add_executable(tent_tpu_engine_test tpu/tpu_engine_test.cpp)
+  add_dependencies(tent_tpu_engine_test mock_tpu_pjrt)
+  target_link_libraries(
+    tent_tpu_engine_test PRIVATE gtest gtest_main tent_link_group
+                                 ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_engine_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_engine_test COMMAND tent_tpu_engine_test)
+  set_tests_properties(tent_tpu_engine_test PROPERTIES TIMEOUT 300)
+
+  # The route chosen for a staged TPU request must carry all of its chunks.
+  add_executable(tent_tpu_staged_route_test tpu/tpu_staged_route_test.cpp)
+  add_dependencies(tent_tpu_staged_route_test mock_tpu_pjrt)
+  target_link_libraries(
+    tent_tpu_staged_route_test PRIVATE gtest gtest_main tent_link_group
+                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_staged_route_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_staged_route_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_staged_route_test COMMAND tent_tpu_staged_route_test)
+  set_tests_properties(tent_tpu_staged_route_test PROPERTIES TIMEOUT 300)
+endif()
+
+# A host-only initiator against a peer process that owns TPU memory. The peer
+# needs a USE_TPU build. A USE_TPU build runs both roles from this binary; a
+# build without USE_TPU, a genuinely host-only initiator, runs it only when
+# TENT_TPU_MOCK_PEER names this binary from a USE_TPU build.
+if(USE_TPU OR TENT_TPU_MOCK_PEER)
+  add_executable(tent_tpu_host_initiator_test tpu/tpu_host_initiator_test.cpp)
+  target_link_libraries(tent_tpu_host_initiator_test
+                        PRIVATE gtest tent_link_group ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_host_initiator_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_tpu_host_initiator_test
+           COMMAND tent_tpu_host_initiator_test)
+  set_tests_properties(tent_tpu_host_initiator_test PROPERTIES TIMEOUT 300)
+  if(USE_TPU)
+    add_dependencies(tent_tpu_host_initiator_test mock_tpu_pjrt)
+    target_compile_definitions(
+      tent_tpu_host_initiator_test
+      PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  else()
+    set_tests_properties(
+      tent_tpu_host_initiator_test
+      PROPERTIES ENVIRONMENT "TENT_TPU_MOCK_PEER=${TENT_TPU_MOCK_PEER}")
+  endif()
 endif()
 
 # XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer

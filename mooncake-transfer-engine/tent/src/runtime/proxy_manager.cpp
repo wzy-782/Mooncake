@@ -228,18 +228,25 @@ Status ProxyManager::deconstruct() {
     return Status::OK();
 }
 
-BatchID ProxyManager::submitCrossStage(const Request& request,
-                                       uint64_t local_stage_buffer,
-                                       uint64_t remote_stage_buffer,
-                                       uint64_t chunk_length) {
+BatchID ProxyManager::submitCrossStage(
+    const Request& request, const std::shared_ptr<const StagedRoute>& route,
+    uint64_t local_stage_buffer, uint64_t remote_stage_buffer,
+    uint64_t chunk_length) {
     Request inter_stage;
     inter_stage.opcode = request.opcode;
     inter_stage.source = (void*)local_stage_buffer;
     inter_stage.length = chunk_length;
     inter_stage.target_id = request.target_id;
     inter_stage.target_offset = remote_stage_buffer;
+    if (route) {
+        // The staged request's scheduling metadata; `route` picks the
+        // transport.
+        inter_stage.priority = request.priority;
+        inter_stage.intent_type = request.intent_type;
+        inter_stage.deadline_ns = request.deadline_ns;
+    }
     auto batch = impl_->allocateBatch(1);
-    auto status = impl_->submitStagingTransfer(batch, {inter_stage});
+    auto status = impl_->submitStagingTransfer(batch, {inter_stage}, route);
     if (!status.ok()) {
         LOG(WARNING) << "failed to submit cross-stage transfer: "
                      << status.ToString();
@@ -320,22 +327,24 @@ void ProxyManager::submitRemoteStage(
         });
 }
 
-Status ProxyManager::waitCrossStage(const Request& request,
-                                    uint64_t local_stage_buffer,
-                                    uint64_t remote_stage_buffer,
-                                    uint64_t chunk_length) {
-    auto batch = submitCrossStage(request, local_stage_buffer,
+Status ProxyManager::waitCrossStage(
+    const Request& request, const std::shared_ptr<const StagedRoute>& route,
+    uint64_t local_stage_buffer, uint64_t remote_stage_buffer,
+    uint64_t chunk_length) {
+    auto batch = submitCrossStage(request, route, local_stage_buffer,
                                   remote_stage_buffer, chunk_length);
     if (!batch) return Status::TooManyRequests("submit cross stage failed");
     return impl_->waitTransferCompletion(batch);
 }
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
-                            const std::vector<std::string>& params) {
+                            const std::vector<std::string>& params,
+                            std::shared_ptr<const StagedRoute> route) {
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.batch = batch;
     staging_task.params = params;
+    staging_task.route = std::move(route);
     task->staging_status.store(PENDING, std::memory_order_relaxed);
     static std::atomic<size_t> next_queue_index(0);
     thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
@@ -504,6 +513,7 @@ Status ProxyManager::transferEventLoop(
         undrained_remote_operations) {
     buffers_safe_to_release = true;
     auto& request = task.native->request;
+    const auto& route = task.route;
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
@@ -704,7 +714,7 @@ Status ProxyManager::transferEventLoop(
                     }
                     remote_locked.insert(chunk.remote_buf);
                 }
-                chunk.batch = submitCrossStage(request, chunk.local_buf,
+                chunk.batch = submitCrossStage(request, route, chunk.local_buf,
                                                chunk.remote_buf, chunk.length);
                 if (!chunk.batch) {
                     chunk.state = StageState::FAILED;
@@ -846,6 +856,7 @@ Status ProxyManager::transferEventLoop(
 
 Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     auto& request = task.native->request;
+    const auto& route = task.route;
     uint64_t local_stage_buffer = 0, remote_stage_buffer = 0;
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
@@ -877,7 +888,7 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
                                             chunk_length, offset));
             }
 
-            CHECK_STATUS(waitCrossStage(request, local_stage_buffer,
+            CHECK_STATUS(waitCrossStage(request, route, local_stage_buffer,
                                         remote_stage_buffer, chunk_length));
 
             if (remote_staging) {
@@ -893,7 +904,7 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
                                              offset));
             }
 
-            CHECK_STATUS(waitCrossStage(request, local_stage_buffer,
+            CHECK_STATUS(waitCrossStage(request, route, local_stage_buffer,
                                         remote_stage_buffer, chunk_length));
 
             if (local_staging) {

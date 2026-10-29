@@ -70,6 +70,14 @@ struct LogicalTransferRuntimePolicy {
     bool enable_auto_failover_on_poll{kDefaultAutoFailoverOnPoll};
 };
 
+// The route of a staged request. ProxyManager submits each host-to-host hop
+// of the request as a transfer of its own, a chunk long and between host
+// buffers; with this, the hop is routed as the staged request was.
+struct StagedRoute {
+    Request request;         // The staged request.
+    int transport_index{0};  // Its current candidate; hops fail over from it.
+};
+
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
@@ -84,6 +92,9 @@ struct TaskInfo {
     std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
     size_t public_length{0};  // Original API request; request may be merged.
+    // Set on the host-to-host hops of a staged request: they are routed with
+    // it instead of by their own request.
+    std::shared_ptr<const StagedRoute> staged_route;
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
@@ -124,6 +135,7 @@ struct TaskInfo {
           qp_pool(other.qp_pool),
           request(other.request),
           public_length(other.public_length),
+          staged_route(other.staged_route),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -150,6 +162,7 @@ struct TaskInfo {
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
           public_length(other.public_length),
+          staged_route(std::move(other.staged_route)),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -177,6 +190,7 @@ struct TaskInfo {
             qp_pool = other.qp_pool;
             request = other.request;
             public_length = other.public_length;
+            staged_route = other.staged_route;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -209,6 +223,7 @@ struct TaskInfo {
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
             public_length = other.public_length;
+            staged_route = std::move(other.staged_route);
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -462,13 +477,17 @@ class TransferEngineImpl {
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<Request>& request_list,
-                          const Notification* notifi, QueueOwnerKind owner_kind,
-                          bool require_post_submit_cancellation = false);
+    Status submitTransfer(
+        BatchID batch_id, const std::vector<Request>& request_list,
+        const Notification* notifi, QueueOwnerKind owner_kind,
+        bool require_post_submit_cancellation = false,
+        std::shared_ptr<const StagedRoute> staged_route = nullptr);
 
-    Status submitStagingTransfer(BatchID batch_id,
-                                 const std::vector<Request>& request_list);
+    // Submits ProxyManager's sub-transfers of a staged request. Pass
+    // `staged_route` for its host-to-host hops.
+    Status submitStagingTransfer(
+        BatchID batch_id, const std::vector<Request>& request_list,
+        std::shared_ptr<const StagedRoute> staged_route = nullptr);
 
     Status enqueuePreparedSubmit(Batch* batch, const PreparedSubmit& prepared,
                                  QueueOwnerKind owner_kind);
@@ -476,9 +495,10 @@ class TransferEngineImpl {
     bool shouldQueueSubmit(const PreparedSubmit& prepared,
                            QueueOwnerKind owner_kind) const;
 
-    Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
-                         PreparedSubmit& prepared,
-                         bool require_post_submit_cancellation = false);
+    Status prepareSubmit(
+        Batch* batch, const std::vector<Request>& request_list,
+        PreparedSubmit& prepared, bool require_post_submit_cancellation = false,
+        std::shared_ptr<const StagedRoute> staged_route = nullptr);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 
@@ -530,6 +550,18 @@ class TransferEngineImpl {
 
     SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
+
+    // resolveTransport for `req`, or, for a host-to-host hop of a staged
+    // request, the staged request's route at `transport_index` past its
+    // current candidate.
+    SelectionResult resolveRoute(const Request& req, const StagedRoute* staged,
+                                 int transport_index);
+
+    // The StagedRoute for the hops of `request`, staged on `route` at
+    // `transport_index`, or null if the hops route by themselves.
+    static std::shared_ptr<const StagedRoute> hopRoute(
+        const SelectionResult& route, const Request& request,
+        int transport_index);
 
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
