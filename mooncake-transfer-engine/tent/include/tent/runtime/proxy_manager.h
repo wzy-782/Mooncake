@@ -74,6 +74,12 @@ class ProxyManager {
    private:
     void runner(size_t id);
 
+    // Pins `count` stage buffers on each staged side of `task` into `local`
+    // and `remote`, all or none. A full pool makes the transfer wait, holding
+    // no buffer meanwhile, since transfers on the other workers share it.
+    Status reserveStageBuffers(const StagingTask& task, StageBufferCache* cache,
+                               size_t count, uint64_t* local, uint64_t* remote);
+
     Status transferEventLoop(
         StagingTask& task, StageBufferCache* cache,
         bool& buffers_safe_to_release, std::vector<BatchID>& undrained_batches,
@@ -149,6 +155,8 @@ class ProxyManager {
         std::mutex mu;
         std::condition_variable cv;
         std::queue<StagingTask> queue;
+        // Tasks queued on or running in this worker.
+        std::atomic<size_t> pending{0};
     };
     const static size_t kShards = 8;
     WorkerShard shards_[kShards];
