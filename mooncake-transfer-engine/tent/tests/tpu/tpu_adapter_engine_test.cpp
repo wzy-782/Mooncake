@@ -479,6 +479,39 @@ TEST_P(TpuAdapterEngineTest, BatchOfRequestsAcrossManyBuffers) {
     }
 }
 
+// One batch of transfers that each need every slot of the four-slot staging
+// pool. The staging workers run them concurrently, so all but one wait for
+// stage buffers instead of failing, and every slot is free afterwards.
+TEST_P(TpuAdapterEngineTest, BatchLargerThanTheStagePoolWaitsForBuffers) {
+    constexpr int kRequests = 3;
+    std::vector<Side> local, peer;
+    for (int i = 0; i < kRequests; ++i) {
+        local.push_back(tpu(*a_, kLength));
+        peer.push_back(tpu(*b_, kLength));
+    }
+    for (auto op : {Request::WRITE, Request::READ}) {
+        SCOPED_TRACE(op == Request::WRITE ? "WRITE" : "READ");
+        auto& src = op == Request::WRITE ? local : peer;
+        auto& dst = op == Request::WRITE ? peer : local;
+        std::vector<Request> requests;
+        std::vector<std::vector<uint8_t>> expected;
+        for (int i = 0; i < kRequests; ++i) {
+            expected.push_back(pattern(kLength, ++seed_));
+            std::memcpy(src[i].bytes, expected.back().data(), kLength);
+            std::memset(dst[i].bytes, kGuard, kLength);
+            requests.push_back(request(op, local[i], 0, peer[i], 0, kLength));
+        }
+        auto status = run(requests);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kRequests * kLength);
+        for (int i = 0; i < kRequests; ++i) {
+            EXPECT_EQ(0, std::memcmp(dst[i].bytes, expected[i].data(), kLength))
+                << "request " << i;
+        }
+    }
+    expectIdle();
+}
+
 TEST_P(TpuAdapterEngineTest, ProviderCopyFailureFailsThenRecovers) {
     Side local = tpu(*a_, kLength);
     Side peer = tpu(*b_, kLength);

@@ -3861,7 +3861,9 @@ Status TransferEngineImpl::transferSync(
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
     uint64_t addr = 0;
     auto status = staging_proxy_->pinStageBuffer(location, addr);
-    if (!status.ok()) LOG(ERROR) << status.ToString();
+    // A full pool is transient: a peer pinning remotely backs off and retries.
+    if (!status.ok() && !status.IsTooManyRequests())
+        LOG(ERROR) << status.ToString();
     return addr;
 }
 
