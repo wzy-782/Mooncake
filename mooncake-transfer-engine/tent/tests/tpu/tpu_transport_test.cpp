@@ -25,15 +25,25 @@
 // yields 0xDD rather than the buffer's data. That makes the data assertions
 // below real detectors of the "device pointer misclassified as host memory"
 // failure mode, instead of accidentally passing.
+//
+// Every case runs twice: with the copies on the submitting thread, and on the
+// transport's copy pool, where they finish after submitTransferTasks()
+// returns.
 
 #include "tent/transport/tpu/tpu_transport.h"
 
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <thread>
 #include <vector>
+
+#include "tent/common/config.h"
 
 #ifndef MOCK_TPU_PJRT_LIB
 #error "MOCK_TPU_PJRT_LIB must be defined by the build (path to mock adapter)"
@@ -51,7 +61,10 @@ using ResetFn = void (*)();
 constexpr size_t kChunk = 4ul << 20;  // ProxyManager's default chunk_size
 constexpr size_t kBufSize = 3 * kChunk;
 
-class TpuTransportTest : public ::testing::Test {
+// The parameter is transports/tpu/max_concurrent_tasks: 0 copies on the
+// submitting thread, and a positive count runs the copies on that many pool
+// threads.
+class TpuTransportTest : public ::testing::TestWithParam<size_t> {
    protected:
     static void SetUpTestSuite() {
         ::setenv("MC_TPU_PJRT_LIB", MOCK_TPU_PJRT_LIB, /*overwrite=*/1);
@@ -73,9 +86,10 @@ class TpuTransportTest : public ::testing::Test {
         ASSERT_NE(reset_, nullptr);
         reset_();
 
+        auto conf = std::make_shared<Config>();
+        conf->set("transports/tpu/max_concurrent_tasks", GetParam());
         std::string segment = "local";
-        ASSERT_TRUE(
-            transport_.install(segment, nullptr, nullptr, nullptr).ok());
+        ASSERT_TRUE(transport_.install(segment, nullptr, nullptr, conf).ok());
     }
 
     void TearDown() override {
@@ -84,14 +98,29 @@ class TpuTransportTest : public ::testing::Test {
         if (mock_) dlclose(mock_);
     }
 
+    // Waits until task `id` of `batch` leaves PENDING and returns its status.
+    TransferStatus waitFor(Transport::SubBatchRef batch, int id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        TransferStatus status{};
+        do {
+            EXPECT_TRUE(transport_.getTransferStatus(batch, id, status).ok());
+            if (status.s != TransferStatusEnum::PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        return status;
+    }
+
     // Runs one request through the transport and returns its final status.
     TransferStatus run(const Request &request) {
         Transport::SubBatchRef batch = nullptr;
         EXPECT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
         EXPECT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
-        TransferStatus status{};
-        EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
-        EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+        auto status = waitFor(batch, 0);
+        // A copy still running would write into a freed batch: keep it.
+        if (status.s != TransferStatusEnum::PENDING) {
+            EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+        }
         return status;
     }
 
@@ -117,7 +146,7 @@ class TpuTransportTest : public ::testing::Test {
 // The local WRITE stage of chunk #1: source is an interior device address.
 // Before interior pointers were part of the adapter contract this silently
 // memcpy()d from a non-data token and still reported COMPLETED.
-TEST_F(TpuTransportTest, LocalStageCopiesFromInteriorDeviceOffset) {
+TEST_P(TpuTransportTest, LocalStageCopiesFromInteriorDeviceOffset) {
     auto *token = static_cast<uint8_t *>(register_(kBufSize, /*index=*/0));
     ASSERT_NE(token, nullptr);
     auto *data = static_cast<uint8_t *>(device_data_(token));
@@ -135,7 +164,7 @@ TEST_F(TpuTransportTest, LocalStageCopiesFromInteriorDeviceOffset) {
 }
 
 // The mirrored remote stage: the device side is `target_offset`, at an offset.
-TEST_F(TpuTransportTest, RemoteStageCopiesToInteriorDeviceOffset) {
+TEST_P(TpuTransportTest, RemoteStageCopiesToInteriorDeviceOffset) {
     auto *token = static_cast<uint8_t *>(register_(kBufSize, /*index=*/0));
     ASSERT_NE(token, nullptr);
     std::vector<uint8_t> staging(kChunk);
@@ -150,7 +179,7 @@ TEST_F(TpuTransportTest, RemoteStageCopiesToInteriorDeviceOffset) {
 }
 
 // A READ stage moves host staging -> device.
-TEST_F(TpuTransportTest, ReadStageCopiesHostToDevice) {
+TEST_P(TpuTransportTest, ReadStageCopiesHostToDevice) {
     auto *token = static_cast<uint8_t *>(register_(kBufSize, /*index=*/0));
     ASSERT_NE(token, nullptr);
     std::vector<uint8_t> staging(kChunk, 0xAB);
@@ -165,7 +194,7 @@ TEST_F(TpuTransportTest, ReadStageCopiesHostToDevice) {
 // Neither side is device memory: the adapter is missing, or it failed to
 // classify an interior pointer. Either way the transport must fail rather than
 // let Platform::copy memcpy from a token that is not the buffer's data.
-TEST_F(TpuTransportTest, FailsWhenNeitherSideIsDeviceMemory) {
+TEST_P(TpuTransportTest, FailsWhenNeitherSideIsDeviceMemory) {
     std::vector<uint8_t> host_a(4096, 1), host_b(4096, 2);
     auto status = run(makeRequest(Request::WRITE, host_a.data(),
                                   (uint64_t)host_b.data(), host_a.size()));
@@ -176,7 +205,7 @@ TEST_F(TpuTransportTest, FailsWhenNeitherSideIsDeviceMemory) {
 }
 
 // Both sides device: HBM<->HBM is not a staging hop and must be rejected.
-TEST_F(TpuTransportTest, FailsWhenBothSidesAreDeviceMemory) {
+TEST_P(TpuTransportTest, FailsWhenBothSidesAreDeviceMemory) {
     auto *a = static_cast<uint8_t *>(register_(kBufSize, /*index=*/0));
     auto *b = static_cast<uint8_t *>(register_(kBufSize, /*index=*/1));
     ASSERT_NE(a, nullptr);
@@ -187,7 +216,7 @@ TEST_F(TpuTransportTest, FailsWhenBothSidesAreDeviceMemory) {
 }
 
 // TPU HBM can never be a remote peer; a non-local target is a routing bug.
-TEST_F(TpuTransportTest, FailsOnNonLocalTarget) {
+TEST_P(TpuTransportTest, FailsOnNonLocalTarget) {
     auto *token = static_cast<uint8_t *>(register_(kBufSize, /*index=*/0));
     ASSERT_NE(token, nullptr);
     std::vector<uint8_t> staging(kChunk, 0);
@@ -198,6 +227,80 @@ TEST_F(TpuTransportTest, FailsOnNonLocalTarget) {
     auto status = run(request);
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
 }
+
+// ProxyManager keeps many chunks in flight. Each copy must land in its own
+// staging slot, whichever pool thread runs it.
+TEST_P(TpuTransportTest, ManyCopiesInFlightAllLand) {
+    constexpr size_t kCopies = 32;
+    constexpr size_t kSlice = 256ul << 10;
+    auto *token =
+        static_cast<uint8_t *>(register_(kCopies * kSlice, /*index=*/0));
+    ASSERT_NE(token, nullptr);
+    auto *data = static_cast<uint8_t *>(device_data_(token));
+    for (size_t i = 0; i < kCopies * kSlice; ++i) data[i] = (uint8_t)(i % 239);
+    std::vector<uint8_t> staging(kCopies * kSlice, 0);
+
+    std::vector<Request> requests;
+    for (size_t i = 0; i < kCopies; ++i) {
+        requests.push_back(
+            makeRequest(Request::WRITE, token + i * kSlice,
+                        (uint64_t)(staging.data() + i * kSlice), kSlice));
+    }
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, kCopies).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, requests).ok());
+    // Wait for all of them before asserting, so no copy outlives `staging`.
+    std::vector<TransferStatus> statuses;
+    for (size_t i = 0; i < kCopies; ++i)
+        statuses.push_back(waitFor(batch, static_cast<int>(i)));
+    for (size_t i = 0; i < kCopies; ++i) {
+        EXPECT_EQ(statuses[i].s, TransferStatusEnum::COMPLETED) << "copy " << i;
+        EXPECT_EQ(statuses[i].transferred_bytes, kSlice) << "copy " << i;
+    }
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_EQ(0, std::memcmp(staging.data(), data, kCopies * kSlice));
+}
+
+// Engine teardown calls quiesce() before it frees batches: every submitted
+// copy must be terminal when it returns, and no new copy may start after it.
+TEST_P(TpuTransportTest, QuiesceFinishesQueuedCopiesThenRejectsNew) {
+    constexpr size_t kCopies = 16;
+    auto *token =
+        static_cast<uint8_t *>(register_(kCopies * kChunk, /*index=*/0));
+    ASSERT_NE(token, nullptr);
+    auto *data = static_cast<uint8_t *>(device_data_(token));
+    for (size_t i = 0; i < kCopies * kChunk; ++i) data[i] = (uint8_t)(i % 233);
+    std::vector<uint8_t> staging(kCopies * kChunk, 0);
+
+    std::vector<Request> requests;
+    for (size_t i = 0; i < kCopies; ++i) {
+        requests.push_back(
+            makeRequest(Request::WRITE, token + i * kChunk,
+                        (uint64_t)(staging.data() + i * kChunk), kChunk));
+    }
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, kCopies + 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, requests).ok());
+    ASSERT_TRUE(transport_.quiesce().ok());
+
+    for (size_t i = 0; i < kCopies; ++i) {
+        TransferStatus status{};
+        ASSERT_TRUE(
+            transport_.getTransferStatus(batch, static_cast<int>(i), status)
+                .ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED) << "copy " << i;
+    }
+    EXPECT_EQ(0, std::memcmp(staging.data(), data, kCopies * kChunk));
+    EXPECT_FALSE(transport_.submitTransferTasks(batch, {requests[0]}).ok());
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CopyThreads, TpuTransportTest, ::testing::Values(size_t{0}, size_t{4}),
+    [](const ::testing::TestParamInfo<size_t> &info) {
+        return info.param == 0 ? std::string("Inline")
+                               : "Pool" + std::to_string(info.param);
+    });
 
 }  // namespace
 }  // namespace tent
