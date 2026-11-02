@@ -54,6 +54,8 @@ int mc_tpu_pjrt_copy_d2h(void *host_dst, const void *device_src, size_t len);
 int mc_tpu_pjrt_copy_h2d(void *device_dst, const void *host_src, size_t len);
 int mc_tpu_pjrt_device_count(void);
 int mc_tpu_pjrt_device_numa(int index);
+int mc_tpu_pjrt_dma_map(void *host, size_t len);
+int mc_tpu_pjrt_dma_unmap(void *host);
 ```
 
 - **Discovery:** the library path defaults to `libmooncake_tpu_pjrt.so` and can
@@ -82,10 +84,28 @@ A mock adapter and unit tests that exercise this ABI on any Linux host live in
 backed by shadow storage, so a copy that bypasses the adapter yields `0xDD`
 rather than accidentally producing the right answer.
 
+## DMA-mapped staging pools
+
+HBM↔host copies through host memory that the TPU runtime has not DMA-mapped
+are slower, and their speed depends on the host page size (see the `copy`
+section of `tent/benchmark/tpu_hbm_bench.py`). `TpuTransport` therefore
+DMA-maps every host staging pool that TENT registers
+(`MemoryOptions::internal`) through `mc_tpu_pjrt_dma_map`, and unmaps it when
+the pool is unregistered. The built-in adapter forwards both calls to the
+buffer provider's `dma_map`/`dma_unmap` (provider ABI version 2), which a JAX
+provider implements with `PjRtClient::DmaMap`/`DmaUnmap`.
+
+- **Best effort:** a provider serving ABI version 1, or a failed mapping,
+  leaves the pool unmapped. Transfers still work, only with slower copies.
+- **TENT's pools only:** host memory registered by users is never mapped. It
+  is not TENT's to pin, and its owner may have mapped it already, while PJRT
+  keys mappings by address.
+- **Lifetime:** pools are unmapped when the engine releases them, so destroy
+  the `TransferEngine` before shutting down the framework runtime.
+
 ## Not yet included (follow-ups)
 
 - Serving-framework (JAX / PyTorch-XLA) integration that registers TPU buffers.
-- DMA-mapped (pinned) staging buffers for true async device DMA, and the
-  interaction between device DMA-mapping and RDMA memory registration on the
-  same host buffer.
+- Testing DMA-mapped staging pools that are also RDMA-registered: both pin the
+  same host pages, and so far only TCP and HP TCP carried the host-to-host hop.
 - Benchmarks on real TPU hardware.

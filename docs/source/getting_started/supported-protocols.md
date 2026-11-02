@@ -481,7 +481,9 @@ copies to a pluggable TPU buffer provider; a JAX provider built on
   `libmooncake_tpu_pjrt.so`, and installs it in the `mooncake` Python package.
 - A TPU buffer provider library implementing `tpu_buffer_provider.h`, built
   with the ML framework so that it can reach the framework's device buffers.
-  No PJRT/TPU SDK is required to build Mooncake.
+  No PJRT/TPU SDK is required to build Mooncake. With a provider serving ABI
+  version 2, TENT also DMA-maps its host staging buffers; version 1 providers
+  work without it, with slower HBM ↔ host copies.
 - An RDMA (or TCP) transport enabled for the host ↔ host hop.
 
 **Usage:** register the framework's device arrays with the adapter *before*
@@ -534,6 +536,9 @@ engine.batch_unregister_memory([shard.fake_addr for shard in flat])
 tpu.unregister(flat)  # The adapter then releases the provider handles.
 ```
 
+6. Destroy the `TransferEngine` before shutting down the framework runtime
+   too: the engine DMA-unmaps its staging buffers through the provider then.
+
 **Design notes:**
 - TPU memory is reported as a distinct memory type (`tpu:N` locations); the
   staging policy routes the local HBM ↔ host copy to the TPU device-copy
@@ -546,8 +551,9 @@ tpu.unregister(flat)  # The adapter then releases the provider handles.
 - Each registered buffer gets a fake address: an inaccessible reserved address range of
   the buffer's size. Interior addresses (`fake_address + offset`) resolve back to the
   buffer, which the chunked staging pipeline relies on.
-- DMA-mapped (pinned) staging buffers for true async device DMA are a planned
-  performance follow-up.
+- With a provider serving ABI version 2, TENT DMA-maps the host staging
+  buffers it allocates, so HBM ↔ host copies run as direct device DMA. Host
+  memory registered by users is not mapped.
 
 (intel-xpu-transport)=
 ### Intel XPU Transport (xpu)

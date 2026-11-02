@@ -25,6 +25,7 @@
 
 #include <dlfcn.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -54,12 +55,15 @@ using ReleaseFn = int (*)(uint64_t);
 using InitFn = int (*)();
 using CopyD2HFn = int (*)(void *, const void *, size_t);
 using CopyH2DFn = int (*)(void *, const void *, size_t);
+using DmaMapFn = int (*)(void *, size_t);
+using DmaUnmapFn = int (*)(void *);
 
 // Mock provider test helpers.
 using CreateFn = uint64_t (*)(size_t, int, int);
 using DataFn = uint8_t *(*)(uint64_t);
 using CountFn = int (*)();
 using SetFailFn = void (*)(int);
+using SetAbiFn = void (*)(uint32_t);
 
 template <typename Fn>
 Fn sym(void *lib, const char *name) {
@@ -85,21 +89,30 @@ class TpuPjrtAdapterTest : public ::testing::Test {
         init_ = sym<InitFn>(adapter_, "mc_tpu_pjrt_init");
         d2h_ = sym<CopyD2HFn>(adapter_, "mc_tpu_pjrt_copy_d2h");
         h2d_ = sym<CopyH2DFn>(adapter_, "mc_tpu_pjrt_copy_h2d");
+        dma_map_ = sym<DmaMapFn>(adapter_, "mc_tpu_pjrt_dma_map");
+        dma_unmap_ = sym<DmaUnmapFn>(adapter_, "mc_tpu_pjrt_dma_unmap");
         create_ = sym<CreateFn>(provider_, "mock_provider_create_buffer");
         data_ = sym<DataFn>(provider_, "mock_provider_buffer_data");
         live_ = sym<CountFn>(provider_, "mock_provider_live_count");
         released_ = sym<CountFn>(provider_, "mock_provider_released_count");
         set_fail_ = sym<SetFailFn>(provider_, "mock_provider_set_fail_copies");
+        set_abi_ = sym<SetAbiFn>(provider_, "mock_provider_set_abi_version");
+        set_fail_dma_map_ =
+            sym<SetFailFn>(provider_, "mock_provider_set_fail_dma_map");
+        mappings_ = sym<CountFn>(provider_, "mock_provider_dma_mapping_count");
         for (void *fn : {(void *)load_, (void *)register_, (void *)unregister_,
                          (void *)release_, (void *)init_, (void *)d2h_,
-                         (void *)h2d_, (void *)create_, (void *)data_,
-                         (void *)live_, (void *)released_, (void *)set_fail_}) {
+                         (void *)h2d_, (void *)dma_map_, (void *)dma_unmap_,
+                         (void *)create_, (void *)data_, (void *)live_,
+                         (void *)released_, (void *)set_fail_, (void *)set_abi_,
+                         (void *)set_fail_dma_map_, (void *)mappings_}) {
             ASSERT_NE(fn, nullptr);
         }
     }
 
     void TearDown() override {
         if (set_fail_) set_fail_(0);
+        if (set_fail_dma_map_) set_fail_dma_map_(0);
     }
 
     struct Registered {
@@ -125,15 +138,48 @@ class TpuPjrtAdapterTest : public ::testing::Test {
     InitFn init_ = nullptr;
     CopyD2HFn d2h_ = nullptr;
     CopyH2DFn h2d_ = nullptr;
+    DmaMapFn dma_map_ = nullptr;
+    DmaUnmapFn dma_unmap_ = nullptr;
     CreateFn create_ = nullptr;
     DataFn data_ = nullptr;
     CountFn live_ = nullptr;
     CountFn released_ = nullptr;
     SetFailFn set_fail_ = nullptr;
+    SetAbiFn set_abi_ = nullptr;
+    SetFailFn set_fail_dma_map_ = nullptr;
+    CountFn mappings_ = nullptr;
 };
 
 void *TpuPjrtAdapterTest::adapter_ = nullptr;
 void *TpuPjrtAdapterTest::provider_ = nullptr;
+
+// Page-aligned host memory, as TENT's staging pools are.
+struct PageBuffer {
+    const size_t size = 4 * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *data = std::aligned_alloc(size / 4, size);
+    ~PageBuffer() { std::free(data); }
+};
+
+// A provider built against ABI version 1, before DMA mapping, still binds and
+// copies. A bound provider stays bound, so this runs in a child process
+// before the parent binds the mock at version 2.
+TEST_F(TpuPjrtAdapterTest, BindsVersionOneProviderWithoutDmaMapping) {
+    auto bind_and_copy = [this] {
+        set_abi_(1);
+        uint64_t fake_addr = 0, size = 0;
+        int device = -1;
+        std::vector<uint8_t> out(kChunk);
+        PageBuffer host;
+        return load_(MOCK_TPU_BUFFER_PROVIDER_LIB) == 0 &&
+               register_(create_(kChunk, 0, 0), &fake_addr, &size, &device) ==
+                   0 &&
+               d2h_(out.data(), reinterpret_cast<void *>(fake_addr), kChunk) ==
+                   0 &&
+               dma_map_(host.data, host.size) != 0;
+    };
+    EXPECT_EXIT(std::_Exit(bind_and_copy() ? 0 : 1),
+                ::testing::ExitedWithCode(0), "serves ABI version 1");
+}
 
 TEST_F(TpuPjrtAdapterTest, RejectsIncompatibleProvidersThenBindsOnce) {
     uint64_t fake_addr = 0, size = 0;
@@ -199,6 +245,22 @@ TEST_F(TpuPjrtAdapterTest, ReleaseBufferDropsAnUnadoptedHandle) {
     EXPECT_NE(release_(0), 0);
 }
 
+TEST_F(TpuPjrtAdapterTest, DmaMappingReachesTheProvider) {
+    PageBuffer host;
+    ASSERT_NE(host.data, nullptr);
+    const int before = mappings_();
+    ASSERT_EQ(dma_map_(host.data, host.size), 0);
+    EXPECT_EQ(mappings_(), before + 1);
+    EXPECT_EQ(dma_unmap_(host.data), 0);
+    EXPECT_EQ(mappings_(), before);
+
+    // Provider failures propagate.
+    EXPECT_NE(dma_unmap_(host.data), 0);  // No longer mapped.
+    set_fail_dma_map_(1);
+    EXPECT_NE(dma_map_(host.data, host.size), 0);
+    EXPECT_EQ(mappings_(), before);
+}
+
 TEST_F(TpuPjrtAdapterTest,
        AbiCopiesThroughInteriorFakeAddressesReachTheProvider) {
     Registered r = registerNew(3 * kChunk, 0, 0);
@@ -252,6 +314,10 @@ TEST_F(TpuPjrtAdapterTest, RealShimLoadsAdapterAndCopies) {
     ASSERT_TRUE(shim.copyH2D(fake_addr, host.data(), kChunk).ok());
     EXPECT_EQ(device_bytes[0], 0x33);
     EXPECT_FALSE(shim.copyD2H(host.data(), fake_addr + 3 * kChunk, 1).ok());
+
+    PageBuffer staging;
+    ASSERT_TRUE(shim.dmaMap(staging.data, staging.size).ok());
+    EXPECT_TRUE(shim.dmaUnmap(staging.data).ok());
 
     EXPECT_EQ(unregister_(r0.fake_addr), 0);
     EXPECT_EQ(unregister_(r3.fake_addr), 0);

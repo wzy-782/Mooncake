@@ -153,6 +153,7 @@ class TpuAdapterEngineTest : public ::testing::TestWithParam<Params> {
     void TearDown() override {
         env().setFailCopies(false);
         env().setDeviceAlignment(0);
+        env().setFailDmaMap(false);
         // Stop staging while transports and registrations are still alive.
         for (auto* engine : {a_.get(), b_.get()}) {
             if (!engine) continue;
@@ -549,6 +550,31 @@ TEST_P(TpuAdapterEngineTest, UnregisterReleasesProviderHandles) {
 
     // Registration keeps working afterwards.
     roundTrip(tpu(*a_, kLength), peer, kLength);
+}
+
+// Each engine DMA-maps its host staging pool through the provider, so every
+// HBM<->host copy lands in mapped memory, and unmaps it when staging stops.
+TEST_P(TpuAdapterEngineTest, StagingPoolsAreDmaMappedWhileStaging) {
+    const int mappings = env().dmaMappingCount();
+    const int unmapped_copies = env().unmappedCopyCount();
+    roundTrip(tpu(*a_, kLength), tpu(*b_, kLength), kLength);
+    EXPECT_GT(env().dmaMappingCount(), mappings);
+    EXPECT_EQ(env().unmappedCopyCount(), unmapped_copies);
+
+    for (auto* engine : {a_.get(), b_.get()})
+        ASSERT_TRUE(TransferEngineImplTestPeer::stopStaging(*engine).ok());
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+}
+
+// A provider that cannot map memory leaves the pools unmapped, and staging
+// still works, only through unmapped memory.
+TEST_P(TpuAdapterEngineTest, StagesWhenDmaMappingFails) {
+    env().setFailDmaMap(true);
+    const int mappings = env().dmaMappingCount();
+    const int unmapped_copies = env().unmappedCopyCount();
+    roundTrip(tpu(*a_, kLength), tpu(*b_, kLength), kLength);
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+    EXPECT_GT(env().unmappedCopyCount(), unmapped_copies);
 }
 
 INSTANTIATE_TEST_SUITE_P(

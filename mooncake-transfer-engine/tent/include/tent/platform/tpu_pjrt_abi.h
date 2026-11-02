@@ -79,6 +79,16 @@ int mc_tpu_pjrt_device_count(void);
 // NUMA node closest to device `index`, or -1 if unknown.
 int mc_tpu_pjrt_device_numa(int index);
 
+// Registers host memory [host, host + len) with the TPU DMA engine, so device
+// copies into and out of it run as direct DMA. `host` and `len` are page
+// aligned. Returns 0 on success, non-zero if the memory cannot be mapped; it
+// then still works for copies, only slower.
+int mc_tpu_pjrt_dma_map(void *host, size_t len);
+
+// Undoes a successful mc_tpu_pjrt_dma_map of the range starting at `host`,
+// once no copy uses it. Returns 0 on success, non-zero on failure.
+int mc_tpu_pjrt_dma_unmap(void *host);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
