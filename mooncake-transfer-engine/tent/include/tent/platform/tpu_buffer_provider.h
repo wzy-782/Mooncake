@@ -33,6 +33,9 @@
 //
 // Threading: every function may be called concurrently from multiple threads,
 // including for the same handle (TENT stages several chunks at once).
+//
+// Versions: version 2 appends dma_map and dma_unmap to the version 1 table.
+// The adapter still binds version 1 providers, without DMA mapping.
 
 #ifndef TENT_PLATFORM_TPU_BUFFER_PROVIDER_H_
 #define TENT_PLATFORM_TPU_BUFFER_PROVIDER_H_
@@ -44,7 +47,7 @@
 extern "C" {
 #endif
 
-#define MC_TPU_BUFFER_PROVIDER_ABI_VERSION 1u
+#define MC_TPU_BUFFER_PROVIDER_ABI_VERSION 2u
 #define MC_TPU_BUFFER_PROVIDER_ENTRY "mc_tpu_buffer_provider_get"
 
 // Opaque provider-owned handle to one contiguous device buffer. 0 is invalid.
@@ -82,12 +85,30 @@ typedef struct mc_tpu_buffer_provider {
 
     // Drops the adapter's reference to `buffer`.
     void (*release)(mc_tpu_buffer_t buffer);
+
+    // --- Version 2 ---------------------------------------------------------
+
+    // Registers host memory [host, host + len) with the TPU DMA engine (for
+    // PJRT, PjRtClient::DmaMap), so that copies into and out of it run as
+    // direct DMA. TENT maps each host staging pool it allocates: `host` and
+    // `len` are multiples of the page size, and the range overlaps no live
+    // mapping. Return 0 on success, non-zero on failure; TENT then uses the
+    // memory unmapped, only with slower copies.
+    int (*dma_map)(void *host, size_t len);
+
+    // Undoes the dma_map that returned success for the range starting at
+    // `host`. TENT calls it when it releases the pool, after every copy into
+    // or out of it has returned. Return 0 on success, non-zero on failure.
+    int (*dma_unmap)(void *host);
 } mc_tpu_buffer_provider_t;
 
-// Signature of MC_TPU_BUFFER_PROVIDER_ENTRY. Fills `*out` for an ABI version
-// the provider supports, preferably `requested_version`, and returns 0;
-// returns non-zero if it cannot serve `requested_version`. Every function
-// pointer in `*out` must be non-null.
+// Signature of MC_TPU_BUFFER_PROVIDER_ENTRY. Fills `*out` with the table of
+// ABI version `requested_version`, or of an older version the provider
+// supports, sets `out->abi_version` to the version filled, and returns 0;
+// returns non-zero if it can serve neither. Never fill a version newer than
+// `requested_version`: `*out` may be only as large as that version's table.
+// Every function pointer of the filled version must be non-null. The adapter
+// asks for MC_TPU_BUFFER_PROVIDER_ABI_VERSION and, if refused, for version 1.
 typedef int (*mc_tpu_buffer_provider_get_fn)(uint32_t requested_version,
                                              mc_tpu_buffer_provider_t *out);
 

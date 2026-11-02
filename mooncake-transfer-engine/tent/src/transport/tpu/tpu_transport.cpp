@@ -257,10 +257,38 @@ Status TpuTransport::addMemoryBuffer(BufferDesc &desc,
         return Status::OK();  // Not our buffer; leave it untagged.
     }
     desc.transports.push_back(TransportType::TPU);
+    // DMA-map only TENT's own host staging pools: other host memory is not
+    // ours to pin, and its owner may have mapped it already, while PJRT keys
+    // mappings by address.
+    if (!desc.internal || location.type() == "tpu") return Status::OK();
+    void *host = reinterpret_cast<void *>(desc.addr);
+    auto status = TpuPjrtShim::instance().dmaMap(host, desc.length);
+    if (!status.ok()) {
+        // Unmapped memory still works, only with slower copies.
+        LOG(WARNING) << "TpuTransport: cannot DMA-map the " << desc.length
+                     << "-byte host staging buffer at " << host
+                     << "; TPU copies through it will be slower: " << status;
+        return Status::OK();
+    }
+    std::lock_guard<std::mutex> lock(dma_mutex_);
+    dma_mapped_.insert(desc.addr);
     return Status::OK();
 }
 
 Status TpuTransport::removeMemoryBuffer(BufferDesc &desc) {
+    {
+        std::lock_guard<std::mutex> lock(dma_mutex_);
+        if (dma_mapped_.erase(desc.addr) == 0) return Status::OK();
+    }
+    void *host = reinterpret_cast<void *>(desc.addr);
+    auto status = TpuPjrtShim::instance().dmaUnmap(host);
+    // Still OK: the owner frees the memory regardless, and failing would keep
+    // the buffer registered.
+    if (!status.ok()) {
+        LOG(WARNING) << "TpuTransport: cannot DMA-unmap the host staging "
+                        "buffer at "
+                     << host << ": " << status;
+    }
     return Status::OK();
 }
 

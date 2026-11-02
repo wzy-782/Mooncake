@@ -16,11 +16,15 @@
 // built-in TPU adapter without TPU hardware or a real provider such as
 // tpu-sync. Buffers are plain host memory; test-only helpers create them and
 // expose their bytes and lifetime counters. Copies accept any offset unless a
-// test imposes a device-offset alignment, as tpu-sync does.
+// test imposes a device-offset alignment, as tpu-sync does. DMA mappings are
+// only recorded, refusing what PJRT would: unaligned or overlapping ranges.
+
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -43,10 +47,26 @@ std::atomic<int> g_released{0};
 std::atomic<bool> g_fail_copies{false};
 std::atomic<size_t> g_device_alignment{0};  // 0: any offset
 std::atomic<int> g_rejected{0};
+std::map<uintptr_t, size_t> g_dma_mappings;  // host base -> length
+std::atomic<uint32_t> g_abi_version{MC_TPU_BUFFER_PROVIDER_ABI_VERSION};
+std::atomic<bool> g_fail_dma_map{false};
+std::atomic<int> g_unmapped_copies{0};
 
 Buffer *findLocked(mc_tpu_buffer_t handle) {
     auto it = g_buffers.find(handle);
     return it == g_buffers.end() ? nullptr : it->second.get();
+}
+
+// Counts a copy whose host range is not inside one live DMA mapping.
+void countUnmappedLocked(const void *host, size_t len) {
+    const auto a = reinterpret_cast<uintptr_t>(host);
+    auto it = g_dma_mappings.upper_bound(a);
+    if (it != g_dma_mappings.begin()) {
+        --it;
+        const size_t offset = a - it->first;
+        if (offset <= it->second && len <= it->second - offset) return;
+    }
+    ++g_unmapped_copies;
 }
 
 // Whether a copy at `offset` breaks the configured alignment rule.
@@ -84,6 +104,7 @@ int mockCopyToHost(mc_tpu_buffer_t handle, size_t offset, void *dst,
         return 1;
     }
     std::memcpy(dst, b->data.data() + offset, len);
+    countUnmappedLocked(dst, len);
     return 0;
 }
 
@@ -96,6 +117,7 @@ int mockCopyFromHost(mc_tpu_buffer_t handle, size_t offset, const void *src,
         return 1;
     }
     std::memcpy(b->data.data() + offset, src, len);
+    countUnmappedLocked(src, len);
     return 0;
 }
 
@@ -104,18 +126,42 @@ void mockRelease(mc_tpu_buffer_t handle) {
     if (g_buffers.erase(handle) != 0) ++g_released;
 }
 
+int mockDmaMap(void *host, size_t len) {
+    const auto a = reinterpret_cast<uintptr_t>(host);
+    const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    if (g_fail_dma_map || a == 0 || len == 0 || a % page || len % page) {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto next = g_dma_mappings.lower_bound(a);
+    if (next != g_dma_mappings.end() && next->first < a + len) return 1;
+    if (next != g_dma_mappings.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second > a) return 1;
+    }
+    g_dma_mappings[a] = len;
+    return 0;
+}
+
+int mockDmaUnmap(void *host) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_dma_mappings.erase(reinterpret_cast<uintptr_t>(host)) ? 0 : 1;
+}
+
 }  // namespace
 
 extern "C" {
 
 // --- Provider entry point --------------------------------------------------
 
+// Serves every version up to mock_provider_set_abi_version's, filling only
+// the fields of the requested one.
 int mc_tpu_buffer_provider_get(uint32_t requested_version,
                                mc_tpu_buffer_provider_t *out) {
-    if (!out || requested_version != MC_TPU_BUFFER_PROVIDER_ABI_VERSION) {
+    if (!out || requested_version < 1 || requested_version > g_abi_version) {
         return 1;
     }
-    out->abi_version = MC_TPU_BUFFER_PROVIDER_ABI_VERSION;
+    out->abi_version = requested_version;
     out->name = "mock";
     out->size = mockSize;
     out->device_index = mockDevice;
@@ -123,6 +169,10 @@ int mc_tpu_buffer_provider_get(uint32_t requested_version,
     out->copy_to_host = mockCopyToHost;
     out->copy_from_host = mockCopyFromHost;
     out->release = mockRelease;
+    if (requested_version >= 2) {
+        out->dma_map = mockDmaMap;
+        out->dma_unmap = mockDmaUnmap;
+    }
     return 0;
 }
 
@@ -166,5 +216,21 @@ void mock_provider_set_device_alignment(size_t alignment) {
 
 // Copies refused by the alignment rule so far.
 int mock_provider_rejected_count(void) { return g_rejected; }
+
+// Serves ABI versions up to `version` from the next binding on; 1 models a
+// provider built before DMA mapping.
+void mock_provider_set_abi_version(uint32_t version) {
+    g_abi_version = version;
+}
+
+void mock_provider_set_fail_dma_map(int fail) { g_fail_dma_map = fail != 0; }
+
+int mock_provider_dma_mapping_count(void) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return static_cast<int>(g_dma_mappings.size());
+}
+
+// Successful copies so far whose host range was in no live DMA mapping.
+int mock_provider_unmapped_copy_count(void) { return g_unmapped_copies; }
 
 }  // extern "C"
