@@ -598,8 +598,15 @@ SelectionResult TransportSelector::select(
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
     static const std::vector<TransportType> kFabricOnly{FABRIC};
+    // force_tcp pins network hops to TCP; a local HBM<->host copy is not one,
+    // so TpuTransport may carry it ahead of TCP's RPC fallback.
+    static const std::vector<TransportType> kTpuThenTcp{TPU, TCP};
+    const bool local_tpu_copy =
+        context.local_segment && (context.local_memory_type == MTYPE_TPU ||
+                                  context.remote_memory_type == MTYPE_TPU);
+    const auto& forced_tcp = local_tpu_copy ? kTpuThenTcp : kTcpOnly;
     const auto& raw =
-        force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        force_tcp_ && context.segment_type == SegmentType::Memory ? forced_tcp
         : force_fabric_ && context.segment_type == SegmentType::Memory
             ? kFabricOnly
         : !matching_policy->transports.empty() ? matching_policy->transports
