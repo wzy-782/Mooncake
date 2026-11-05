@@ -49,8 +49,12 @@ const mc_tpu_buffer_provider_t *boundProvider() {
 }
 
 bool tableIsComplete(const mc_tpu_buffer_provider_t &t) {
+    if (t.abi_version != 1 &&
+        t.abi_version != MC_TPU_BUFFER_PROVIDER_ABI_VERSION)
+        return false;
     return t.size && t.device_index && t.numa_node && t.copy_to_host &&
-           t.copy_from_host && t.release;
+           t.copy_from_host && t.release &&
+           (t.abi_version == 1 || (t.dma_map && t.dma_unmap));
 }
 
 // A registry region backed by one provider handle. Owns the handle.
@@ -130,18 +134,30 @@ int mc_tpu_adapter_load_provider(const char *path) {
     auto get = reinterpret_cast<mc_tpu_buffer_provider_get_fn>(
         dlsym(handle, MC_TPU_BUFFER_PROVIDER_ENTRY));
     mc_tpu_buffer_provider_t table{};
-    if (!get || get(MC_TPU_BUFFER_PROVIDER_ABI_VERSION, &table) != 0 ||
-        table.abi_version != MC_TPU_BUFFER_PROVIDER_ABI_VERSION ||
-        !tableIsComplete(table)) {
+    int rc = 1;
+    if (get) {
+        rc = get(MC_TPU_BUFFER_PROVIDER_ABI_VERSION, &table);
+        if (rc != 0) {  // Maybe a provider built against version 1.
+            table = {};
+            rc = get(1, &table);
+        }
+    }
+    if (rc != 0 || !tableIsComplete(table)) {
         tpuAdapterLog(std::string("'") + path +
                       "' is not a compatible TPU buffer provider (needs " +
-                      MC_TPU_BUFFER_PROVIDER_ENTRY + " serving ABI version " +
+                      MC_TPU_BUFFER_PROVIDER_ENTRY +
+                      " serving ABI version 1 or " +
                       std::to_string(MC_TPU_BUFFER_PROVIDER_ABI_VERSION) +
                       " with every function set)");
         dlclose(handle);
         return 1;
     }
     if (!table.name) table.name = "unnamed provider";
+    if (table.abi_version == 1) {
+        tpuAdapterLog(std::string(table.name) +
+                      " serves ABI version 1, so TENT's host staging buffers "
+                      "are not DMA-mapped and TPU copies are slower");
+    }
     g_provider_table = table;
     g_provider = &g_provider_table;
     g_provider_path = path;
@@ -223,6 +239,24 @@ int mc_tpu_pjrt_device_count(void) {
 
 int mc_tpu_pjrt_device_numa(int index) {
     return TpuFakeAddressRegistry::instance().deviceNuma(index);
+}
+
+int mc_tpu_pjrt_dma_map(void *host, size_t len) {
+    const mc_tpu_buffer_provider_t *provider = mooncake::tent::boundProvider();
+    if (!provider || !provider->dma_map) return 1;  // Version 1 provider.
+    if (provider->dma_map(host, len) == 0) return 0;
+    tpuAdapterLog(std::string(provider->name) + ": DMA-mapping " +
+                  std::to_string(len) + " bytes of host memory failed");
+    return 1;
+}
+
+int mc_tpu_pjrt_dma_unmap(void *host) {
+    const mc_tpu_buffer_provider_t *provider = mooncake::tent::boundProvider();
+    if (!provider || !provider->dma_unmap) return 1;
+    if (provider->dma_unmap(host) == 0) return 0;
+    tpuAdapterLog(std::string(provider->name) +
+                  ": DMA-unmapping host memory failed");
+    return 1;
 }
 
 }  // extern "C"
