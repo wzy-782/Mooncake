@@ -78,9 +78,14 @@ void TpuPjrtShim::load() {
         reinterpret_cast<int (*)()>(resolve("mc_tpu_pjrt_device_count"));
     fn_device_numa_ =
         reinterpret_cast<int (*)(int)>(resolve("mc_tpu_pjrt_device_numa"));
+    fn_dma_map_ = reinterpret_cast<int (*)(void *, size_t)>(
+        resolve("mc_tpu_pjrt_dma_map"));
+    fn_dma_unmap_ =
+        reinterpret_cast<int (*)(void *)>(resolve("mc_tpu_pjrt_dma_unmap"));
 
     if (!fn_init_ || !fn_is_device_ptr_ || !fn_device_index_ || !fn_copy_d2h_ ||
-        !fn_copy_h2d_ || !fn_device_count_ || !fn_device_numa_) {
+        !fn_copy_h2d_ || !fn_device_count_ || !fn_device_numa_ ||
+        !fn_dma_map_ || !fn_dma_unmap_) {
         LOG(ERROR) << "TpuPjrtShim: adapter '" << lib
                    << "' does not satisfy the required ABI; disabling TPU.";
         dlclose(handle_);
@@ -138,6 +143,22 @@ int TpuPjrtShim::deviceCount() const {
 int TpuPjrtShim::deviceNumaNode(int index) const {
     if (!available_) return -1;
     return fn_device_numa_(index);
+}
+
+Status TpuPjrtShim::dmaMap(void *host, size_t length) const {
+    if (!available_)
+        return Status::NotImplemented("TPU PJRT adapter unavailable" LOC_MARK);
+    if (fn_dma_map_(host, length) != 0)
+        return Status::InternalError("TPU DMA mapping failed" LOC_MARK);
+    return Status::OK();
+}
+
+Status TpuPjrtShim::dmaUnmap(void *host) const {
+    if (!available_)
+        return Status::NotImplemented("TPU PJRT adapter unavailable" LOC_MARK);
+    if (fn_dma_unmap_(host) != 0)
+        return Status::InternalError("TPU DMA unmapping failed" LOC_MARK);
+    return Status::OK();
 }
 
 }  // namespace tent

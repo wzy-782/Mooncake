@@ -40,7 +40,7 @@
 extern "C" {
 #endif
 
-#define MC_TPU_BUFFER_PROVIDER_ABI_VERSION 1u
+#define MC_TPU_BUFFER_PROVIDER_ABI_VERSION 2u
 #define MC_TPU_BUFFER_PROVIDER_ENTRY "mc_tpu_buffer_provider_get"
 
 // Opaque provider-owned handle to one contiguous device buffer. 0 is invalid.
@@ -76,12 +76,28 @@ typedef struct mc_tpu_buffer_provider {
 
     // Drops the adapter's reference to `buffer`.
     void (*release)(mc_tpu_buffer_t buffer);
+
+    // --- Version 2 ---------------------------------------------------------
+
+    // Registers host memory [host, host + len) with the TPU DMA engine (for
+    // PJRT, PjRtClient::DmaMap) so copies to and from it run as direct DMA.
+    // `host` and `len` are page aligned and the range overlaps no live
+    // mapping. Return 0 on success, non-zero on failure (TENT then uses the
+    // memory unmapped, with slower copies).
+    int (*dma_map)(void *host, size_t len);
+
+    // Undoes a successful dma_map of the range at `host`, once every copy
+    // using it has returned. Return 0 on success, non-zero on failure.
+    int (*dma_unmap)(void *host);
 } mc_tpu_buffer_provider_t;
 
-// Signature of MC_TPU_BUFFER_PROVIDER_ENTRY. Fills `*out` for an ABI version
-// the provider supports, preferably `requested_version`, and returns 0;
-// returns non-zero if it cannot serve `requested_version`. Every function
-// pointer in `*out` must be non-null.
+// Signature of MC_TPU_BUFFER_PROVIDER_ENTRY. Fills `*out` with the table of
+// ABI version `requested_version`, or of an older version the provider
+// supports, sets `out->abi_version` to the version filled, and returns 0;
+// returns non-zero if it can serve neither. Never fill a version newer than
+// `requested_version`: `*out` may be only as large as that version's table.
+// Every function pointer of the filled version must be non-null. The adapter
+// asks for MC_TPU_BUFFER_PROVIDER_ABI_VERSION and, if refused, for version 1.
 typedef int (*mc_tpu_buffer_provider_get_fn)(uint32_t requested_version,
                                              mc_tpu_buffer_provider_t *out);
 
