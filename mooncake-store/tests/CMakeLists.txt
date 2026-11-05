@@ -238,8 +238,14 @@ if(USE_TENT)
       transfer_task_test
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
-  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+  # Scatter transfers require a cancellable transport; without RDMA the default
+  # TENT config only installs TCP, so swap it for HP_TCP.
+  set_tests_properties(
+    transfer_scatter_tent_test
+    PROPERTIES
+      ENVIRONMENT
+      "MC_USE_TENT=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":true}}}"
+  )
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
@@ -401,6 +407,7 @@ add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(object_storage_backend_test object_storage_backend_test.cpp)
 add_store_test(kvcs_object_storage_adapter_test
                kvcs_object_storage_adapter_test.cpp)
 if(NOT MOONCAKE_KVCS_SDK_FOUND)
