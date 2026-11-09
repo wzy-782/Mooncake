@@ -48,7 +48,6 @@ std::atomic<bool> g_fail_copies{false};
 std::atomic<size_t> g_device_alignment{0};  // 0: any offset
 std::atomic<int> g_rejected{0};
 std::map<uintptr_t, size_t> g_dma_mappings;  // host base -> length
-std::atomic<uint32_t> g_abi_version{MC_TPU_BUFFER_PROVIDER_ABI_VERSION};
 std::atomic<bool> g_fail_dma_map{false};
 std::atomic<int> g_unmapped_copies{0};
 
@@ -154,14 +153,11 @@ extern "C" {
 
 // --- Provider entry point --------------------------------------------------
 
-// Serves every version up to mock_provider_set_abi_version's, filling only
-// the fields of the requested one.
-int mc_tpu_buffer_provider_get(uint32_t requested_version,
+int mc_tpu_buffer_provider_get(uint32_t /*requested_version*/,
                                mc_tpu_buffer_provider_t *out) {
-    if (!out || requested_version < 1 || requested_version > g_abi_version) {
+    if (!out) {
         return 1;
     }
-    out->abi_version = requested_version;
     out->name = "mock";
     out->size = mockSize;
     out->device_index = mockDevice;
@@ -169,10 +165,8 @@ int mc_tpu_buffer_provider_get(uint32_t requested_version,
     out->copy_to_host = mockCopyToHost;
     out->copy_from_host = mockCopyFromHost;
     out->release = mockRelease;
-    if (requested_version >= 2) {
-        out->dma_map = mockDmaMap;
-        out->dma_unmap = mockDmaUnmap;
-    }
+    out->dma_map = mockDmaMap;
+    out->dma_unmap = mockDmaUnmap;
     return 0;
 }
 
@@ -216,12 +210,6 @@ void mock_provider_set_device_alignment(size_t alignment) {
 
 // Copies refused by the alignment rule so far.
 int mock_provider_rejected_count(void) { return g_rejected; }
-
-// Serves ABI versions up to `version` from the next binding on; 1 models a
-// provider built before DMA mapping.
-void mock_provider_set_abi_version(uint32_t version) {
-    g_abi_version = version;
-}
 
 void mock_provider_set_fail_dma_map(int fail) { g_fail_dma_map = fail != 0; }
 

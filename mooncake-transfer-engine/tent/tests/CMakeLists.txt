@@ -785,7 +785,7 @@ if(USE_TPU)
   add_executable(
     tent_tpu_fake_address_registry_test
     tpu/tpu_fake_address_registry_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_fake_address_registry.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_synthetic_address_registry.cpp)
   target_link_libraries(tent_tpu_fake_address_registry_test PRIVATE gtest
                                                                     gtest_main)
   target_include_directories(tent_tpu_fake_address_registry_test

@@ -12,16 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Control API of Mooncake's built-in TPU adapter, libmooncake_tpu_pjrt.so.
+// Control API for Mooncake's TPU adapter (libmooncake_tpu_pjrt.so).
 //
-// The adapter library serves two callers, which must load the SAME file so
-// they share one registry (dlopen() of an already-loaded file returns it):
-//   * TENT's TpuPjrtShim loads it via MC_TPU_PJRT_LIB and calls the
-//     mc_tpu_pjrt_* data-path ABI (tent/platform/tpu_pjrt_abi.h).
-//   * mooncake.tpu (Python, via ctypes) calls the functions below to bind a
-//     buffer provider and register framework buffers BEFORE the
-//     TransferEngine is created, because TENT reads the TPU device topology
-//     from the adapter once, at engine construction.
+// This library maintains a shared address registry used by two callers:
+//
+// 1. Python (mooncake.tpu):
+//    Calls this control API to bind the buffer provider and register device
+//    buffers before creating the TransferEngine.
+//
+// 2. TENT C++ Engine (TpuPjrtShim):
+//    Reads TPU device topology at startup and executes transfers using the
+//    data-path ABI (see tent/platform/tpu_pjrt_abi.h).
+//
+// Both callers must load the same shared library file so they share one
+// in-process registry instance.
 
 #ifndef TENT_PLUGINS_TPU_TPU_PJRT_ADAPTER_H_
 #define TENT_PLUGINS_TPU_TPU_PJRT_ADAPTER_H_
@@ -32,25 +36,42 @@
 extern "C" {
 #endif
 
-// Loads the TPU buffer provider library at `path` (tpu_buffer_provider.h) and
-// binds its function table. Calling it again with the same path is a no-op; a
-// different path fails while a provider is bound. Returns 0 on success.
+// Loads the TPU buffer provider shared library at `path` and binds its
+// function table (see tent/platform/tpu_buffer_provider.h).
+//
+// Calling with a different path while a provider is already bound returns 
+// an error.
+//
+// Returns 0 on success, non-zero on failure.
 int mc_tpu_adapter_load_provider(const char *path);
 
-// Registers provider handle `buffer`. The adapter takes ownership of the handle
-// even on failure, and releases it once it is unregistered and no copy uses
-// it. On success writes the buffer's fake address (the address to register with
-// the TransferEngine), size in bytes and device index, and returns 0.
-int mc_tpu_adapter_register(uint64_t buffer, uint64_t *fake_addr_out,
+// Registers a device buffer handle from the provider.
+//
+// The adapter takes ownership of `buffer` immediately, releasing it when
+// unregistered and all active transfers finish.
+//
+// On success:
+// - `synthetic_addr_out`: synthetic address to register with TransferEngine
+// - `size_out`: buffer size in bytes
+// - `device_out`: TPU device ordinal (e.g. 0 for "tpu:0")
+//
+// Returns 0 on success, non-zero on failure.
+int mc_tpu_adapter_register(uint64_t buffer, uint64_t *synthetic_addr_out,
                             uint64_t *size_out, int *device_out);
 
-// Unregisters the buffer whose fake address is exactly `fake_addr`. Unregister
-// it from the TransferEngine first. Returns 0 on success, non-zero for an
-// unknown fake address.
-int mc_tpu_adapter_unregister(uint64_t fake_addr);
+// Unregisters a buffer by its synthetic address.
+//
+// Caller should unregister the address from TransferEngine before calling this.
+//
+// Returns 0 on success, non-zero if the address is unknown.
+int mc_tpu_adapter_unregister(uint64_t synthetic_addr);
 
-// Releases a provider handle that was never passed to mc_tpu_adapter_register
-// (e.g. when registering a batch fails part-way). Returns 0 on success.
+// Releases an unregistered buffer handle.
+//
+// Useful for cleanup if batch registration aborts before passing `buffer` to
+// mc_tpu_adapter_register.
+//
+// Returns 0 on success, non-zero on failure.
 int mc_tpu_adapter_release_buffer(uint64_t buffer);
 
 #ifdef __cplusplus

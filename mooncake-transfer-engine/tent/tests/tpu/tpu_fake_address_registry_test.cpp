@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for the TPU adapter's fake-address registry
-// (tent/plugins/tpu/tpu_fake_address_registry.cpp) with a host-memory fake
+// Unit tests for the TPU adapter's synthetic-address registry
+// (tent/plugins/tpu/tpu_synthetic_address_registry.cpp) with a host-memory fake
 // region. No TPU hardware, PJRT runtime or buffer provider required.
 
-#include "tpu_fake_address_registry.h"
+#include "tpu_synthetic_address_registry.h"
 
 #include <gtest/gtest.h>
 
@@ -82,7 +82,7 @@ struct Added {
     FakeRegion *region;  // owned by the registry
 };
 
-Added add(TpuFakeAddressRegistry &registry, size_t size, int device,
+Added add(TpuSyntheticAddrRegistry &registry, size_t size, int device,
           int numa = -1) {
     auto region = std::make_unique<FakeRegion>(size, device, numa);
     FakeRegion *raw = region.get();
@@ -93,8 +93,8 @@ void *at(uintptr_t fake_addr, size_t offset) {
     return reinterpret_cast<void *>(fake_addr + offset);
 }
 
-TEST(TpuFakeAddressRegistryTest, ClassifiesBaseAndInteriorButNotOutside) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, ClassifiesBaseAndInteriorButNotOutside) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, 3 * kChunk, /*device=*/2);
     ASSERT_NE(r.fake_addr, 0u);
 
@@ -111,8 +111,8 @@ TEST(TpuFakeAddressRegistryTest, ClassifiesBaseAndInteriorButNotOutside) {
 
 // The case that silently corrupted data before interior pointers were part of
 // the adapter contract (#2815).
-TEST(TpuFakeAddressRegistryTest, D2HFromInteriorAddressCopiesThatChunk) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, D2HFromInteriorAddressCopiesThatChunk) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, 3 * kChunk, 0);
     std::vector<uint8_t> staging(kChunk, 0);
 
@@ -123,8 +123,8 @@ TEST(TpuFakeAddressRegistryTest, D2HFromInteriorAddressCopiesThatChunk) {
               std::memcmp(staging.data(), r.region->data() + kChunk, kChunk));
 }
 
-TEST(TpuFakeAddressRegistryTest, H2DToInteriorAddressWritesThatChunk) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, H2DToInteriorAddressWritesThatChunk) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, 3 * kChunk, 0);
     std::vector<uint8_t> staging(kChunk, 0xAB);
 
@@ -137,9 +137,9 @@ TEST(TpuFakeAddressRegistryTest, H2DToInteriorAddressWritesThatChunk) {
     EXPECT_NE(r.region->data()[2 * kChunk - 1], 0xAB);  // previous chunk
 }
 
-TEST(TpuFakeAddressRegistryTest,
+TEST(TpuSyntheticAddrRegistryTest,
      CopyRunningPastTheEndFailsWithoutTouchingDevice) {
-    TpuFakeAddressRegistry registry;
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, 2 * kChunk, 0);
     std::vector<uint8_t> staging(kChunk + 1);
 
@@ -154,8 +154,8 @@ TEST(TpuFakeAddressRegistryTest,
     EXPECT_EQ(r.region->calls(), 0);
 }
 
-TEST(TpuFakeAddressRegistryTest, UnknownAddressesAndNullArgumentsFail) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, UnknownAddressesAndNullArgumentsFail) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, kChunk, 0);
     uint8_t host[16];
     int not_a_fake_addr = 0;
@@ -171,8 +171,8 @@ TEST(TpuFakeAddressRegistryTest, UnknownAddressesAndNullArgumentsFail) {
     EXPECT_EQ(r.region->calls(), 0);
 }
 
-TEST(TpuFakeAddressRegistryTest, RegionCopyFailureIsReported) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, RegionCopyFailureIsReported) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, kChunk, 0);
     r.region->setFail(true);
     std::vector<uint8_t> staging(kChunk);
@@ -183,15 +183,15 @@ TEST(TpuFakeAddressRegistryTest, RegionCopyFailureIsReported) {
 
 // Sizes that are not a page multiple leave slack between the region's end and
 // the end of its reservation; that slack must not classify as device memory.
-TEST(TpuFakeAddressRegistryTest, ReservationSlackIsNotPartOfTheRegion) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, ReservationSlackIsNotPartOfTheRegion) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, 100, 0);
     EXPECT_TRUE(registry.contains(at(r.fake_addr, 99)));
     EXPECT_FALSE(registry.contains(at(r.fake_addr, 100)));
 }
 
-TEST(TpuFakeAddressRegistryTest, FakeAddressesOfDifferentRegionsDoNotOverlap) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, FakeAddressesOfDifferentRegionsDoNotOverlap) {
+    TpuSyntheticAddrRegistry registry;
     auto a = add(registry, kChunk, 0);
     auto b = add(registry, kChunk, 1);
     ASSERT_NE(a.fake_addr, 0u);
@@ -202,8 +202,8 @@ TEST(TpuFakeAddressRegistryTest, FakeAddressesOfDifferentRegionsDoNotOverlap) {
     EXPECT_EQ(registry.deviceIndex(at(b.fake_addr, 5)), 1);
 }
 
-TEST(TpuFakeAddressRegistryTest, RemoveDropsRegionButKeepsDevice) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, RemoveDropsRegionButKeepsDevice) {
+    TpuSyntheticAddrRegistry registry;
     auto r = add(registry, kChunk, 3, /*numa=*/1);
     ASSERT_EQ(registry.size(), 1u);
 
@@ -217,8 +217,8 @@ TEST(TpuFakeAddressRegistryTest, RemoveDropsRegionButKeepsDevice) {
     EXPECT_EQ(registry.deviceNuma(3), 1);
 }
 
-TEST(TpuFakeAddressRegistryTest, DeviceTableTracksHighestIndexAndNuma) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, DeviceTableTracksHighestIndexAndNuma) {
+    TpuSyntheticAddrRegistry registry;
     EXPECT_EQ(registry.deviceCount(), 0);
     add(registry, kChunk, 0, /*numa=*/0);
     add(registry, kChunk, 3, /*numa=*/-1);
@@ -230,8 +230,8 @@ TEST(TpuFakeAddressRegistryTest, DeviceTableTracksHighestIndexAndNuma) {
     EXPECT_EQ(registry.deviceNuma(3), 1);
 }
 
-TEST(TpuFakeAddressRegistryTest, RejectsInvalidRegions) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, RejectsInvalidRegions) {
+    TpuSyntheticAddrRegistry registry;
     EXPECT_EQ(registry.add(nullptr), 0u);
     EXPECT_EQ(registry.add(std::make_unique<FakeRegion>(0, 0)), 0u);
     EXPECT_EQ(registry.add(std::make_unique<FakeRegion>(kChunk, -1)), 0u);
@@ -241,8 +241,8 @@ TEST(TpuFakeAddressRegistryTest, RejectsInvalidRegions) {
 
 // TENT may stage several chunks of one region at once while other regions are
 // being registered and unregistered.
-TEST(TpuFakeAddressRegistryTest, ConcurrentCopiesAndRegistrationChurn) {
-    TpuFakeAddressRegistry registry;
+TEST(TpuSyntheticAddrRegistryTest, ConcurrentCopiesAndRegistrationChurn) {
+    TpuSyntheticAddrRegistry registry;
     constexpr size_t kChunks = 8;
     auto r = add(registry, kChunks * kChunk, 0);
     std::atomic<bool> stop{false};
