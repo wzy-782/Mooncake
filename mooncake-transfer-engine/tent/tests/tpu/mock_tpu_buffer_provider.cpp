@@ -103,12 +103,11 @@ void mockRelease(mc_tpu_buffer_t handle) {
 
 extern "C" {
 
-int mc_tpu_buffer_provider_get(uint32_t requested_version,
+int mc_tpu_buffer_provider_get(uint32_t /*requested_version*/,
                                mc_tpu_buffer_provider_t *out) {
-    if (!out || requested_version != MC_TPU_BUFFER_PROVIDER_ABI_VERSION) {
+    if (!out) {
         return 1;
     }
-    out->abi_version = MC_TPU_BUFFER_PROVIDER_ABI_VERSION;
     out->name = "mock";
     out->size = mockSize;
     out->device_index = mockDevice;

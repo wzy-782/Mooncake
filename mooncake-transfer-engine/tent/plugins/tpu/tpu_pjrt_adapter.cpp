@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Mooncake's built-in TPU adapter: TENT's adapter ABI (tpu_pjrt_abi.h) over
-// the fake-address registry; a TPU buffer provider does the device copies.
+// the synthetic-address registry; a TPU buffer provider does the device copies.
 
 // Hidden-visibility build: export only the C entry points in these headers.
 #pragma GCC visibility push(default)
@@ -30,7 +30,7 @@
 #include <string>
 
 #include "tent/platform/tpu_buffer_provider.h"
-#include "tpu_fake_address_registry.h"
+#include "tpu_synthetic_address_registry.h"
 
 namespace mooncake {
 namespace tent {
@@ -43,11 +43,12 @@ std::string g_provider_path;
 mc_tpu_buffer_provider_t g_provider_table{};
 const mc_tpu_buffer_provider_t *g_provider = nullptr;
 
-const mc_tpu_buffer_provider_t *boundProvider() {
+const mc_tpu_buffer_provider_t *getBoundProvider() {
     std::lock_guard<std::mutex> lock(g_provider_mutex);
     return g_provider;
 }
 
+// Checks that every required function pointer in the table is set.
 bool tableIsComplete(const mc_tpu_buffer_provider_t &t) {
     return t.size && t.device_index && t.numa_node && t.copy_to_host &&
            t.copy_from_host && t.release;
@@ -104,7 +105,7 @@ class ProviderRegion : public DeviceRegion {
 }  // namespace mooncake
 
 using mooncake::tent::tpuAdapterLog;
-using mooncake::tent::TpuFakeAddressRegistry;
+using mooncake::tent::TpuSyntheticAddrRegistry;
 
 extern "C" {
 
@@ -130,14 +131,12 @@ int mc_tpu_adapter_load_provider(const char *path) {
     auto get = reinterpret_cast<mc_tpu_buffer_provider_get_fn>(
         dlsym(handle, MC_TPU_BUFFER_PROVIDER_ENTRY));
     mc_tpu_buffer_provider_t table{};
-    if (!get || get(MC_TPU_BUFFER_PROVIDER_ABI_VERSION, &table) != 0 ||
-        table.abi_version != MC_TPU_BUFFER_PROVIDER_ABI_VERSION ||
-        !tableIsComplete(table)) {
+    int rc = get ? get(0, &table) : 1;
+    if (rc != 0 || !tableIsComplete(table)) {
         tpuAdapterLog(std::string("'") + path +
                       "' is not a compatible TPU buffer provider (needs " +
-                      MC_TPU_BUFFER_PROVIDER_ENTRY + " serving ABI version " +
-                      std::to_string(MC_TPU_BUFFER_PROVIDER_ABI_VERSION) +
-                      " with every function set)");
+                      MC_TPU_BUFFER_PROVIDER_ENTRY +
+                      " with every required function set)");
         dlclose(handle);
         return 1;
     }
@@ -148,10 +147,10 @@ int mc_tpu_adapter_load_provider(const char *path) {
     return 0;
 }
 
-int mc_tpu_adapter_register(uint64_t buffer, uint64_t *fake_addr_out,
+int mc_tpu_adapter_register(uint64_t buffer, uint64_t *synthetic_addr_out,
                             uint64_t *size_out, int *device_out) {
     using namespace mooncake::tent;
-    const mc_tpu_buffer_provider_t *provider = boundProvider();
+    const mc_tpu_buffer_provider_t *provider = getBoundProvider();
     if (!provider) {
         tpuAdapterLog("no TPU buffer provider is bound");
         return 1;
@@ -161,25 +160,26 @@ int mc_tpu_adapter_register(uint64_t buffer, uint64_t *fake_addr_out,
     auto region = std::make_unique<ProviderRegion>(provider, buffer);
     const size_t size = region->size();
     const int device = region->deviceIndex();
-    if (!fake_addr_out || !size_out || !device_out) return 1;
-    const uintptr_t fake_addr =
-        TpuFakeAddressRegistry::instance().add(std::move(region));
-    if (fake_addr == 0) return 1;
-    *fake_addr_out = fake_addr;
+    if (!synthetic_addr_out || !size_out || !device_out) return 1;
+    const uintptr_t synthetic_addr =
+        TpuSyntheticAddrRegistry::instance().add(std::move(region));
+    if (synthetic_addr == 0) return 1;
+    *synthetic_addr_out = synthetic_addr;
     *size_out = size;
     *device_out = device;
     return 0;
 }
 
-int mc_tpu_adapter_unregister(uint64_t fake_addr) {
-    return TpuFakeAddressRegistry::instance().remove(
-               static_cast<uintptr_t>(fake_addr))
+int mc_tpu_adapter_unregister(uint64_t synthetic_addr) {
+    return TpuSyntheticAddrRegistry::instance().remove(
+               static_cast<uintptr_t>(synthetic_addr))
                ? 0
                : 1;
 }
 
 int mc_tpu_adapter_release_buffer(uint64_t buffer) {
-    const mc_tpu_buffer_provider_t *provider = mooncake::tent::boundProvider();
+    const mc_tpu_buffer_provider_t *provider =
+        mooncake::tent::getBoundProvider();
     if (!provider || buffer == 0) return 1;
     provider->release(buffer);
     return 0;
@@ -190,7 +190,7 @@ int mc_tpu_adapter_release_buffer(uint64_t buffer) {
 // Fail when no buffers are registered (devices come from them), so TENT
 // disables TPU support loudly instead of running with an empty topology.
 int mc_tpu_pjrt_init(void) {
-    if (TpuFakeAddressRegistry::instance().deviceCount() == 0) {
+    if (TpuSyntheticAddrRegistry::instance().deviceCount() == 0) {
         tpuAdapterLog(
             "no TPU buffers are registered. Register them (e.g. with "
             "mooncake.tpu.prepare) before creating the TransferEngine.");
@@ -200,29 +200,29 @@ int mc_tpu_pjrt_init(void) {
 }
 
 int mc_tpu_pjrt_is_device_ptr(const void *addr) {
-    return TpuFakeAddressRegistry::instance().contains(addr) ? 1 : 0;
+    return TpuSyntheticAddrRegistry::instance().contains(addr) ? 1 : 0;
 }
 
 int mc_tpu_pjrt_device_index(const void *addr) {
-    return TpuFakeAddressRegistry::instance().deviceIndex(addr);
+    return TpuSyntheticAddrRegistry::instance().deviceIndex(addr);
 }
 
 int mc_tpu_pjrt_copy_d2h(void *host_dst, const void *device_src, size_t len) {
-    return TpuFakeAddressRegistry::instance().copyD2H(host_dst, device_src,
-                                                      len);
+    return TpuSyntheticAddrRegistry::instance().copyD2H(host_dst, device_src,
+                                                        len);
 }
 
 int mc_tpu_pjrt_copy_h2d(void *device_dst, const void *host_src, size_t len) {
-    return TpuFakeAddressRegistry::instance().copyH2D(device_dst, host_src,
-                                                      len);
+    return TpuSyntheticAddrRegistry::instance().copyH2D(device_dst, host_src,
+                                                        len);
 }
 
 int mc_tpu_pjrt_device_count(void) {
-    return TpuFakeAddressRegistry::instance().deviceCount();
+    return TpuSyntheticAddrRegistry::instance().deviceCount();
 }
 
 int mc_tpu_pjrt_device_numa(int index) {
-    return TpuFakeAddressRegistry::instance().deviceNuma(index);
+    return TpuSyntheticAddrRegistry::instance().deviceNuma(index);
 }
 
 }  // extern "C"

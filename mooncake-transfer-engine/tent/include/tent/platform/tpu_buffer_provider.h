@@ -22,7 +22,7 @@
 // build against, so the provider is built with the framework instead.
 //
 // Discovery mirrors tent/device_plugin.h: the provider library exports one
-// symbol, MC_TPU_BUFFER_PROVIDER_ENTRY, which fills a versioned function table.
+// symbol, MC_TPU_BUFFER_PROVIDER_ENTRY, which fills a function table.
 //
 // Handles: opaque mc_tpu_buffer_t values (for JAX, one per addressable shard)
 // that the provider hands out through its own framework API. The adapter owns
@@ -40,22 +40,20 @@
 extern "C" {
 #endif
 
-#define MC_TPU_BUFFER_PROVIDER_ABI_VERSION 1u
 #define MC_TPU_BUFFER_PROVIDER_ENTRY "mc_tpu_buffer_provider_get"
 
 // Opaque provider-owned handle to one contiguous device buffer. 0 is invalid.
 typedef uint64_t mc_tpu_buffer_t;
 
 typedef struct mc_tpu_buffer_provider {
-    // ABI version the provider implemented when filling this table.
-    uint32_t abi_version;
     // Human-readable provider name for logs, e.g. "tpu-sync".
     const char *name;
 
-    // Size in bytes of the buffer's on-device representation, or 0 if the
-    // handle is invalid. Offsets passed to the copy functions index into this
-    // representation, which may be tiled; both ends of a transfer must
-    // therefore use buffers with identical shape, dtype and layout.
+    // Total byte size of the on-device buffer, or 0 if the handle is invalid.
+    //
+    // TPU memory may be tiled and padded in hardware. Offsets index directly
+    // into these raw device bytes, so sender and receiver buffers must have
+    // matching shape, dtype, and layout.
     size_t (*size)(mc_tpu_buffer_t buffer);
 
     // Local device ordinal of the buffer (the N in TENT's "tpu:N"), or -1.
@@ -64,11 +62,15 @@ typedef struct mc_tpu_buffer_provider {
     // NUMA node closest to the buffer's device, or -1 if unknown.
     int (*numa_node)(mc_tpu_buffer_t buffer);
 
-    // Blocking copies of bytes [offset, offset + len) of the buffer to/from
-    // host memory. The adapter guarantees the range lies inside the buffer
-    // and never rounds or widens it. A provider may reject offsets it cannot
-    // serve (tpu-sync requires multiples of 32 bytes), but must then fail
-    // without copying. Return 0 on success, non-zero on failure.
+    // Synchronous copy between host memory and buffer range
+    // [offset, offset + len).
+    //
+    // The adapter guarantees the range fits within the buffer and passes
+    // offset and len through without rounding or padding. Providers may enforce
+    // alignment restrictions (e.g., offsets in multiples of 32 bytes) and
+    // return non-zero on unsupported ranges.
+    //
+    // Returns 0 on success, non-zero on failure.
     int (*copy_to_host)(mc_tpu_buffer_t buffer, size_t offset, void *host_dst,
                         size_t len);
     int (*copy_from_host)(mc_tpu_buffer_t buffer, size_t offset,
@@ -78,10 +80,13 @@ typedef struct mc_tpu_buffer_provider {
     void (*release)(mc_tpu_buffer_t buffer);
 } mc_tpu_buffer_provider_t;
 
-// Signature of MC_TPU_BUFFER_PROVIDER_ENTRY. Fills `*out` for an ABI version
-// the provider supports, preferably `requested_version`, and returns 0;
-// returns non-zero if it cannot serve `requested_version`. Every function
-// pointer in `*out` must be non-null.
+// Entry point signature exported by TPU buffer provider plugins
+// (MC_TPU_BUFFER_PROVIDER_ENTRY).
+//
+// Mooncake resolves this function via dlsym() after dlopen()ing the plugin
+// shared library to populate `*out` with the provider's callback table.
+//
+// Returns 0 on success, non-zero on failure.
 typedef int (*mc_tpu_buffer_provider_get_fn)(uint32_t requested_version,
                                              mc_tpu_buffer_provider_t *out);
 

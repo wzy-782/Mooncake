@@ -3,7 +3,7 @@
 # Mooncake's dependencies, so link only libdl and the C++ standard library.
 
 add_library(tent_tpu_pjrt_adapter SHARED tpu_pjrt_adapter.cpp
-                                         tpu_fake_address_registry.cpp)
+                                         tpu_synthetic_address_registry.cpp)
 
 target_link_libraries(tent_tpu_pjrt_adapter PRIVATE tent_plugin
                                                     ${CMAKE_DL_LIBS})

@@ -12,17 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Fake-address registry for Mooncake's built-in TPU adapter.
+// Synthetic-address registry for Mooncake's built-in TPU adapter.
 //
-// TENT addresses memory by pointer and splits staged transfers by pointer
-// arithmetic, but a TPU buffer has no host address. So each registered region
-// gets a FAKE ADDRESS: the base of a PROT_NONE reservation as large as the
-// region, which never aliases host memory and faults if dereferenced. Any
-// address inside [fake_addr, fake_addr + size) resolves back to (region,
-// offset), because TENT passes interior addresses (see tpu_pjrt_abi.h).
+// TENT is built around host-style pointer arithmetic: it tracks buffers by
+// virtual address, divides staged transfers into chunks via pointer arithmetic
+// (`addr + chunk_offset`), and expects memory transfers to operate on those
+// pointers.
+//
+// TPU device memory has no CPU virtual addresses. Instead, TPU copy APIs
+// address device memory using an opaque handle and an integer byte offset:
+// `(mc_tpu_buffer_t handle, size_t offset)`.
+//
+// This registry bridges the two models:
+//
+//   * Each registered TPU buffer is assigned a synthetic virtual address:
+//     the base of a reserved, inaccessible (PROT_NONE) address range spanning
+//     the buffer's size. It costs zero RAM and immediately segfaults if
+//     accidentally dereferenced.
+//   * When TENT transfers a chunk using an address
+//     (`synthetic_addr + chunk_offset`), the registry resolves that address
+//     back to the `(buffer_handle, offset)` required by the TPU hardware copy
+//     function (`copy_to_host` / `copy_from_host`).
 
-#ifndef TENT_PLUGINS_TPU_TPU_FAKE_ADDRESS_REGISTRY_H_
-#define TENT_PLUGINS_TPU_TPU_FAKE_ADDRESS_REGISTRY_H_
+#ifndef TENT_PLUGINS_TPU_SYNTHETIC_ADDRESS_REGISTRY_H_
+#define TENT_PLUGINS_TPU_SYNTHETIC_ADDRESS_REGISTRY_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -59,23 +72,25 @@ class DeviceRegion {
                               size_t len) = 0;
 };
 
-class TpuFakeAddressRegistry {
+class TpuSyntheticAddrRegistry {
    public:
-    TpuFakeAddressRegistry() = default;
-    ~TpuFakeAddressRegistry();
-    TpuFakeAddressRegistry(const TpuFakeAddressRegistry &) = delete;
-    TpuFakeAddressRegistry &operator=(const TpuFakeAddressRegistry &) = delete;
+    TpuSyntheticAddrRegistry() = default;
+    ~TpuSyntheticAddrRegistry();
+    TpuSyntheticAddrRegistry(const TpuSyntheticAddrRegistry &) = delete;
+    TpuSyntheticAddrRegistry &operator=(const TpuSyntheticAddrRegistry &) =
+        delete;
 
-    static TpuFakeAddressRegistry &instance();
+    static TpuSyntheticAddrRegistry &instance();
 
-    // Registers `region` and returns its fake address, or 0 on failure (the
-    // region is then destroyed).
+    // Registers `region` and returns its synthetic address, or 0 on failure
+    // (the region is then destroyed).
     uintptr_t add(std::unique_ptr<DeviceRegion> region);
 
-    // Unregisters the region whose fake address is exactly `fake_addr`. Returns
+    // Unregisters the region that corresponds to `synthetic_addr`. Returns
     // false if there is none. Copies already in flight keep the region alive
-    // until they finish. The device stays known (see deviceCount).
-    bool remove(uintptr_t fake_addr);
+    // until they finish. The device stays known (see deviceCount) if all
+    // buffers are removed.
+    bool remove(uintptr_t synthetic_addr);
 
     // --- Operations behind the mc_tpu_pjrt_* ABI ---------------------------
 
@@ -107,11 +122,11 @@ class TpuFakeAddressRegistry {
                                           size_t *offset) const;
 
     mutable std::shared_mutex mutex_;
-    std::map<uintptr_t, Entry> regions_;  // keyed by fake address (range base)
+    std::map<uintptr_t, Entry> regions_;  // keyed by synthetic base address
     std::map<int, int> device_numa_;      // device index -> NUMA (sticky)
 };
 
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // TENT_PLUGINS_TPU_TPU_FAKE_ADDRESS_REGISTRY_H_
+#endif  // TENT_PLUGINS_TPU_SYNTHETIC_ADDRESS_REGISTRY_H_
