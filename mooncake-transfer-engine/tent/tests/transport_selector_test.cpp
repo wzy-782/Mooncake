@@ -231,6 +231,40 @@ TEST(TransportSelectorTest, ForceTcpDoesNotOverrideFileTransportPolicy) {
     EXPECT_EQ(selector.select(ctx, transports).transport, GDS);
 }
 
+// A local HBM<->host copy is not a network hop. TCP claims device
+// capabilities on a TPU platform, so it would otherwise carry the copy.
+TEST(TransportSelectorTest, ForceTcpKeepsLocalTpuCopiesOnTheTpuTransport) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {TPU, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        auto* fake = static_cast<FakeTransport*>(transports[type].get());
+        fake->setGpuToDram(true);
+        fake->setDramToGpu(true);
+    }
+
+    // The buffer's own order does not matter: force_tcp ignores it.
+    std::vector<TransportType> buffer_transports = {TCP, TPU};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_TPU;  // HBM -> host stage
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TPU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, TCP);
+
+    ctx.local_memory_type = MTYPE_CPU;  // host stage -> HBM
+    ctx.remote_memory_type = MTYPE_TPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TPU);
+}
+
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------
