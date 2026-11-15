@@ -253,6 +253,9 @@ class HighPerformanceTcpClient::Lane
         auto self = shared_from_this();
         asio::async_write(
             socket_, asio::buffer(data, chunk),
+            [chunk](const std::error_code& error, size_t sent) -> size_t {
+                return error ? 0 : std::min<size_t>(chunk - sent, 256 << 10);
+            },
             [self, epoch, chunk](const std::error_code& error, size_t bytes) {
                 self->runHandler(epoch, [&] {
                     if (self->finishForcedIfAny()) return;
@@ -324,7 +327,8 @@ class HighPerformanceTcpClient::Lane
         asio::async_read(
             socket_, asio::buffer(data, chunk),
             [chunk](const std::error_code& error, size_t received) -> size_t {
-                return error ? 0 : chunk - received;
+                return error ? 0
+                             : std::min<size_t>(chunk - received, 256 << 10);
             },
             [self, epoch, chunk](const std::error_code& error, size_t bytes) {
                 self->runHandler(epoch, [&] {

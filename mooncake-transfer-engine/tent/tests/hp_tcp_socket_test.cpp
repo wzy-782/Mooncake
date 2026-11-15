@@ -63,10 +63,10 @@ __attribute__((no_sanitize("thread"))) bool SocketOrderedEqual(
 class Runtime {
    public:
     explicit Runtime(size_t max_connections = 16, uint64_t timeout_ms = 500,
-                     uint64_t idle_timeout_ms = 60000)
+                     uint64_t idle_timeout_ms = 60000, size_t chunk_size = 128)
         : workers({.worker_count = 2}),
-          client({.max_transfer_bytes = 1 << 20,
-                  .chunk_size = 128,
+          client({.max_transfer_bytes = 4 << 20,
+                  .chunk_size = chunk_size,
                   .connect_timeout_ms = 500,
                   .progress_timeout_ms = timeout_ms,
                   .connections_per_peer = 2,
@@ -74,8 +74,8 @@ class Runtime {
                  &workers),
           server({.bind_address = "127.0.0.1",
                   .port = 0,
-                  .max_transfer_bytes = 1 << 20,
-                  .chunk_size = 128,
+                  .max_transfer_bytes = 4 << 20,
+                  .chunk_size = chunk_size,
                   .progress_timeout_ms = timeout_ms,
                   .max_connections = max_connections},
                  &registry, &workers) {}
@@ -508,6 +508,121 @@ TEST(HighPerformanceTcpSocketTest,
     EXPECT_EQ(completion.status, TIMEOUT);
     EXPECT_EQ(completion.bytes, 0u);
     EXPECT_FALSE(completion.protocol_status.has_value());
+}
+
+// The body still has to arrive whole, across fragments and the chunk tail,
+// before the server answers.
+TEST(HighPerformanceTcpSocketTest,
+     FragmentedWriteBodyCompletesAcrossChunkTail) {
+    constexpr size_t kChunk = 1 << 20;
+    constexpr size_t kLength = kChunk + 17;
+    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/1000,
+                    /*idle_timeout_ms=*/60000, kChunk);
+    runtime.start();
+    std::array<uint8_t, kLength> remote{};
+    std::array<uint8_t, kLength> payload{};
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = i % 251;
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    const auto request = EncodeHighPerformanceTcpRequest(
+        {HighPerformanceTcpOpcode::kWrite, 51, registration,
+         reinterpret_cast<uint64_t>(remote.data()), kLength});
+    asio::write(socket, asio::buffer(request));
+    asio::write(socket, asio::buffer(payload.data(), 65533));
+    std::this_thread::sleep_for(1ms);
+    asio::write(socket, asio::buffer(payload.data() + 65533, 29));
+    std::this_thread::sleep_for(1ms);
+    asio::write(socket, asio::buffer(payload.data() + 65562, kLength - 65562));
+
+    std::array<uint8_t, kHighPerformanceTcpResponseSize> response_bytes{};
+    ASSERT_EQ(asio::read(socket, asio::buffer(response_bytes)),
+              response_bytes.size());
+    HighPerformanceTcpResponseFrame response;
+    ASSERT_TRUE(DecodeHighPerformanceTcpResponse(
+                    response_bytes.data(), response_bytes.size(), &response)
+                    .ok());
+    EXPECT_EQ(response.status, HighPerformanceTcpStatus::kOk);
+    EXPECT_EQ(response.request_id, 51u);
+    EXPECT_EQ(response.committed_bytes, kLength);
+    EXPECT_TRUE(SocketOrderedEqual(remote, payload));
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     TruncatedWriteBodyTailClosesWithoutResponse) {
+    constexpr size_t kChunk = 1 << 20;
+    constexpr size_t kLength = kChunk + 17;
+    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/1000,
+                    /*idle_timeout_ms=*/60000, kChunk);
+    runtime.start();
+    std::array<uint8_t, kLength> remote{};
+    std::array<uint8_t, kLength> payload{};
+    payload.fill(0x5a);
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    const auto request = EncodeHighPerformanceTcpRequest(
+        {HighPerformanceTcpOpcode::kWrite, 52, registration,
+         reinterpret_cast<uint64_t>(remote.data()), kLength});
+    asio::write(socket, asio::buffer(request));
+    asio::write(socket, asio::buffer(payload.data(), kLength - 1));
+    socket.shutdown(asio::ip::tcp::socket::shutdown_send);
+
+    ASSERT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 0; }));
+    std::array<uint8_t, kHighPerformanceTcpResponseSize> response_bytes{};
+    std::error_code error;
+    EXPECT_EQ(asio::read(socket, asio::buffer(response_bytes), error), 0u);
+    EXPECT_TRUE(error);
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     StalledWriteBodyTailTimesOutWithoutResponse) {
+    constexpr size_t kChunk = 1 << 20;
+    constexpr size_t kLength = kChunk + 17;
+    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/100,
+                    /*idle_timeout_ms=*/60000, kChunk);
+    runtime.start();
+    std::array<uint8_t, kLength> remote{};
+    std::array<uint8_t, kLength> payload{};
+    payload.fill(0x5a);
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect({asio::ip::make_address("127.0.0.1"), runtime.port});
+    const auto request = EncodeHighPerformanceTcpRequest(
+        {HighPerformanceTcpOpcode::kWrite, 53, registration,
+         reinterpret_cast<uint64_t>(remote.data()), kLength});
+    asio::write(socket, asio::buffer(request));
+    asio::write(socket, asio::buffer(payload.data(), kChunk + 7));
+
+    // The peer stays open without the last ten bytes: the session must time
+    // out rather than treat the first chunk as the whole body.
+    ASSERT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 1; }));
+    ASSERT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 0; }));
+    std::array<uint8_t, kHighPerformanceTcpResponseSize> response_bytes{};
+    std::error_code error;
+    EXPECT_EQ(asio::read(socket, asio::buffer(response_bytes), error), 0u);
+    EXPECT_TRUE(error);
 }
 
 TEST(HighPerformanceTcpSocketTest, ClientBindsConfiguredSourceAddress) {
