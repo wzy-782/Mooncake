@@ -127,7 +127,7 @@ spec:
 
                 INIT_HOST="${JS_NAME}-initiator-0-0.${JS_NAME}"
                 INIT_IP=""
-                for _ in $(seq 1 120); do
+                for _ in $(seq 1 900); do
                   INIT_IP=$(python3 -c "import socket,sys; print(socket.gethostbyname(sys.argv[1]))" "$INIT_HOST" 2>/dev/null || true)
                   [ -n "$INIT_IP" ] && break
                   sleep 1
@@ -140,7 +140,7 @@ spec:
                   python3 - "$host" "$port" <<'PY'
                 import socket, sys, time
                 h, p = sys.argv[1], int(sys.argv[2])
-                for _ in range(300):
+                for _ in range(900):
                     try:
                         with socket.create_connection((h, p), timeout=2):
                             sys.exit(0)
