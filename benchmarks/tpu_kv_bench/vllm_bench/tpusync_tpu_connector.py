@@ -239,7 +239,8 @@ class _TpuSyncStoreBridge:
         deadline = time.perf_counter() + self.poll_timeout_s
         sleep_s = 0.0005
         while time.perf_counter() < deadline:
-            done, failed = poll_fn()
+            res = poll_fn()
+            done, failed = res[0], res[1]
             for h in done:
                 if h in expected:
                     done_set.add(h)
