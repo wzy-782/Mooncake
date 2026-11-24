@@ -863,3 +863,10 @@ class TpuSyncTPUDisaggConnector(KVConnectorBase_V1):
         if self._bridge is not None:
             self._bridge.close()
             self._bridge = None
+
+
+# Aliases accepted by tpu_platform.py's kv_connector allowlist when loaded via
+# kv_connector_module_path="tpusync_tpu_connector".
+TPUOffloadConnector = TpuSyncTPUOffloadConnector
+RaidenOffloadConnector = TpuSyncTPUOffloadConnector
+TPUConnector = TpuSyncTPUDisaggConnector

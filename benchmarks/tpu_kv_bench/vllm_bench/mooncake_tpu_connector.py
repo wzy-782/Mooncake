@@ -793,3 +793,10 @@ class MooncakeTPUDisaggConnector(KVConnectorBase_V1):
         if self._bridge is not None:
             self._bridge.close()
             self._bridge = None
+
+
+# Aliases accepted by tpu_platform.py's kv_connector allowlist when loaded via
+# kv_connector_module_path="mooncake_tpu_connector".
+TPUOffloadConnector = MooncakeTPUOffloadConnector
+RaidenOffloadConnector = MooncakeTPUOffloadConnector
+TPUConnector = MooncakeTPUDisaggConnector

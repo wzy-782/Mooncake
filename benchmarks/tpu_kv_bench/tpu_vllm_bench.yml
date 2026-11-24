@@ -175,7 +175,7 @@ spec:
                       export MOONCAKE_METADATA_URL="http://${INIT_IP}:8080/metadata"
                       export MOONCAKE_HOST_IP="$MY_IP"
                       export MOONCAKE_GLOBAL_SEGMENT_GB="$HOST_CACHE_GB"
-                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUOffloadConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_both"}')
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUOffloadConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_both"}')
                       ;;
                     tpu_sync)
                       wait_tcp "$INIT_IP" 50051
@@ -183,7 +183,7 @@ spec:
                       export TPUSYNC_HOST_IP="$MY_IP"
                       export TPUSYNC_NODE_ID="$NODE_ID"
                       export TPUSYNC_HOST_CACHE_GB="$HOST_CACHE_GB"
-                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUOffloadConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_both"}')
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUOffloadConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_both"}')
                       ;;
                     raiden_local)
                       export TPU_OFFLOAD_NUM_CPU_CHUNKS="${TPU_OFFLOAD_NUM_CPU_CHUNKS:-8192}"
@@ -206,7 +206,7 @@ spec:
                       export MOONCAKE_METADATA_URL="http://${INIT_IP}:8080/metadata"
                       export MOONCAKE_HOST_IP="$MY_IP"
                       export MOONCAKE_GLOBAL_SEGMENT_GB="${MOONCAKE_DECODE_SEGMENT_GB:-4}"
-                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUDisaggConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_consumer"}')
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_consumer"}')
                       ;;
                     tpu_sync)
                       if [ "$DISAGG_CONNECTOR" = "raiden" ]; then
@@ -220,7 +220,7 @@ spec:
                         export TPUSYNC_HOST_IP="$MY_IP"
                         export TPUSYNC_NODE_ID="$NODE_ID"
                         export TPUSYNC_HOST_CACHE_GB="${TPUSYNC_DECODE_CACHE_GB:-4}"
-                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUDisaggConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_consumer"}')
+                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_consumer"}')
                       fi
                       ;;
                     *)
@@ -455,9 +455,9 @@ spec:
                   case "$BACKEND" in
                     baseline) ;;
                     mooncake)
-                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUOffloadConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_both"}') ;;
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUOffloadConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_both"}') ;;
                     tpu_sync)
-                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUOffloadConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_both"}') ;;
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUOffloadConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_both"}') ;;
                     raiden_local)
                       export TPU_OFFLOAD_NUM_CPU_CHUNKS="${TPU_OFFLOAD_NUM_CPU_CHUNKS:-8192}"
                       KV_ARGS=(--kv-transfer-config '{"kv_connector":"RaidenOffloadConnector","kv_connector_module_path":"tpu_inference.offload.raiden_offload_connector","kv_role":"kv_both"}') ;;
@@ -469,7 +469,7 @@ spec:
                   COMMON_ARGS+=(--no-enable-prefix-caching --async-scheduling --max-num-batched-tokens 8192)
                   case "$BACKEND" in
                     mooncake)
-                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUDisaggConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_producer"}') ;;
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_producer"}') ;;
                     tpu_sync)
                       if [ "$DISAGG_CONNECTOR" = "raiden" ]; then
                         export RAIDEN_NUM_SLOTS="${RAIDEN_NUM_SLOTS:-30}"
@@ -477,7 +477,7 @@ spec:
                         export TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT:-9100}"
                         KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"tpu_inference.distributed.tpu_raiden_connector","kv_role":"kv_producer"}')
                       else
-                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUDisaggConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_producer"}')
+                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_producer"}')
                       fi
                       ;;
                     *) echo "Unknown BACKEND=$BACKEND for disagg_1p1d" >&2; exit 1 ;;
