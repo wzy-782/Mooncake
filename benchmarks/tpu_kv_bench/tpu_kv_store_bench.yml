@@ -1,0 +1,160 @@
+# CDK recipe: Tier 2 multi-host trace-driven TPU KV-store benchmark comparing
+# Mooncake Store (TENT TPU path) against tpu-sync KVCacheStore across 2+ tpu7x
+# pods (2x2x1, 4 chips per pod).
+#
+# run_tpu_kv_store_bench.sh (next to this file) bundles python3.12, jax, libtpu,
+# mooncake (including mooncake_master), tpu-sync (including _tpu_raiden_jax.so,
+# global_registry_server, and kv_cache_host_store_node_main), FAST'25 traces,
+# and kv_store_bench/*.py into /opt/mooncake-bench via --map-dir.
+#
+# Variables: PEERS (default 1 => 2 total TPU hosts), BENCH_ARGS, PORT, CPU, MEMORY.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: mooncake-tpu-kv-store-bench
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - initiator
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+  - name: peer
+    replicas: {{ .PEERS | default "1" }}
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: "tpu7x"
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            containers:
+            - name: peer
+              image: ubuntu:22.04
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: PEER_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - {name: MEGASCALE_NUM_SLICES, value: ""}
+              - {name: MEGASCALE_SLICE_ID, value: ""}
+              - {name: MEGASCALE_PORT, value: ""}
+              - {name: MEGASCALE_COORDINATOR_ADDRESS, value: ""}
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -euo pipefail
+                unset MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID MEGASCALE_PORT MEGASCALE_COORDINATOR_ADDRESS
+                B=/opt/mooncake-bench
+                export PYTHONHOME=$B/python
+                export PYTHONPATH=$B/site-packages:$B/tpu-sync
+                export LD_LIBRARY_PATH=$B/lib
+                export PATH=$B/bin:$B/python/bin:$PATH
+                export PYTHONUNBUFFERED=1
+                export TPU_VISIBLE_CHIPS=0,1,2,3
+                NODE_ID=$(( ${PEER_INDEX:-0} + 1 ))
+                exec $B/python/bin/python3.12 $B/kv_store_bench/bench_runner.py \
+                  --role agent \
+                  --node-id "${NODE_ID}" \
+                  --coordinator "${JS_NAME}-initiator-0-0.${JS_NAME}:{{ .PORT | default "5566" }}"
+              resources:
+                limits:
+                  cpu: "{{ .CPU | default "64" }}"
+                  memory: "{{ .MEMORY | default "256Gi" }}"
+                  google.com/tpu: 4
+                requests:
+                  cpu: "{{ .CPU | default "64" }}"
+                  memory: "{{ .MEMORY | default "256Gi" }}"
+                  google.com/tpu: 4
+            restartPolicy: Never
+
+  - name: initiator
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: "tpu7x"
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            containers:
+            - name: initiator
+              image: ubuntu:22.04
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - {name: MEGASCALE_NUM_SLICES, value: ""}
+              - {name: MEGASCALE_SLICE_ID, value: ""}
+              - {name: MEGASCALE_PORT, value: ""}
+              - {name: MEGASCALE_COORDINATOR_ADDRESS, value: ""}
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -euo pipefail
+                unset MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID MEGASCALE_PORT MEGASCALE_COORDINATOR_ADDRESS
+                B=/opt/mooncake-bench
+                export PYTHONHOME=$B/python
+                export PYTHONPATH=$B/site-packages:$B/tpu-sync
+                export LD_LIBRARY_PATH=$B/lib
+                export PATH=$B/bin:$B/python/bin:$PATH
+                export PYTHONUNBUFFERED=1
+                export TPU_VISIBLE_CHIPS=0,1,2,3
+                export TPU_SYNC_ROOT=$B/tpu-sync
+                cat $B/BUNDLE_INFO
+                OUT=${CDK_OUTPUT_DIR:-/tmp/tpu_kv_store_bench}
+                mkdir -p "$OUT"
+                NUM_NODES=$(( {{ .PEERS | default "1" }} + 1 ))
+                $B/python/bin/python3.12 $B/kv_store_bench/bench_runner.py \
+                  --role coordinator \
+                  --num-nodes "${NUM_NODES}" \
+                  --listen-port {{ .PORT | default "5566" }} \
+                  --trace-dir "$B/traces" \
+                  --mooncake-master-bin "$B/bin/mooncake_master" \
+                  --tpusync-registry-bin "$B/bin/global_registry_server" \
+                  --tpusync-store-node-bin "$B/bin/kv_cache_host_store_node_main" \
+                  --output-dir "$OUT" \
+                  {{ .BENCH_ARGS | default "--backends mooncake,tpu_sync --geometry medium --num-requests 160" }} \
+                  | tee "$OUT/run.log"
+              resources:
+                limits:
+                  cpu: "{{ .CPU | default "64" }}"
+                  memory: "{{ .MEMORY | default "256Gi" }}"
+                  google.com/tpu: 4
+                requests:
+                  cpu: "{{ .CPU | default "64" }}"
+                  memory: "{{ .MEMORY | default "256Gi" }}"
+                  google.com/tpu: 4
+            restartPolicy: Never

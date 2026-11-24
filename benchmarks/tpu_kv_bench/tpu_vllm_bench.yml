@@ -1,0 +1,541 @@
+# CDK recipe: Tier 3 multi-host end-to-end vLLM serving benchmark comparing
+# baseline HBM, tpu-sync (`KVCacheStore` / `tpu_raiden_connector`), and Mooncake
+# Store (`TENT TPU`) across 2+ tpu7x pods (2x2x1, 4 chips / 8 TensorCores each).
+#
+# run_tpu_vllm_bench.sh (next to this file) mounts a lightweight ~300 MiB overlay
+# (Mooncake, tpu-sync, vllm_bench connectors + harness + FAST'25 traces) into
+# /opt/mooncake-vllm inside the stock `vllm/vllm-tpu:nightly` container image.
+#
+# Modes:
+#   MODE=offload_cluster (default): N replicated vLLM serving pods behind
+#     rr_router.py sharing a distributed KV prefix pool (baseline | tpu_sync |
+#     mooncake | tpu_offload | raiden_local).
+#   MODE=disagg_1p1d: Initiator = Prefill (kv_producer) + toy_proxy_server.py +
+#     serve_bench.py; Peer(s) = Decode (kv_consumer) (mooncake | tpu_sync).
+#
+# Key variables:
+#   IMAGE, MODE, BACKEND, DISAGG_CONNECTOR, PEERS, MODEL, TP_SIZE, MAX_MODEL_LEN,
+#   GPU_MEM_UTIL, KV_CACHE_DTYPE, BLOCK_SIZE, HOST_CACHE_GB, ROUTER_POLICY,
+#   HF_TOKEN, VLLM_EXTRA_ARGS, BENCH_ARGS, CPU, MEMORY.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: mooncake-tpu-vllm-bench
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - initiator
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+  - name: peer
+    replicas: {{ .PEERS | default "1" }}
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: "tpu7x"
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: hf-token-volume
+              secret:
+                secretName: vllm-hf-token
+                optional: true
+                items:
+                - key: HF_TOKEN
+                  path: token
+            - name: huggingface-storage
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    accessModes: ["ReadWriteOnce"]
+                    storageClassName: "premium-rwo"
+                    resources:
+                      requests:
+                        storage: 100Gi
+            containers:
+            - name: peer
+              image: {{ .IMAGE | default "vllm/vllm-tpu:nightly" }}
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: hf-token-volume
+                mountPath: /var/run/hf-token
+                readOnly: true
+              - name: huggingface-storage
+                mountPath: /root/.cache/huggingface
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: PEER_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - {name: MEGASCALE_NUM_SLICES, value: ""}
+              - {name: MEGASCALE_SLICE_ID, value: ""}
+              - {name: MEGASCALE_PORT, value: ""}
+              - {name: MEGASCALE_COORDINATOR_ADDRESS, value: ""}
+              - {name: JAX_PLATFORMS, value: "tpu,cpu"}
+              - {name: TPU_BACKEND_TYPE, value: "jax"}
+              - {name: PJRT_DEVICE, value: "TPU"}
+              - {name: MODEL_IMPL_TYPE, value: "vllm"}
+              - {name: HF_TOKEN, value: "{{ .HF_TOKEN | default "" }}"}
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -euo pipefail
+                unset MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID MEGASCALE_PORT MEGASCALE_COORDINATOR_ADDRESS
+                [ -z "${HF_TOKEN:-}" ] && [ -s /var/run/hf-token/token ] && export HF_TOKEN="$(cat /var/run/hf-token/token)"
+                [ -z "${HF_TOKEN:-}" ] && unset HF_TOKEN
+                sysctl -w vm.max_map_count=8388608 2>/dev/null || true
+                if [ -w /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                  echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit 2>/dev/null || true
+                fi
+
+                B=/opt/mooncake-vllm
+                export PYTHONPATH="$B/vllm_bench:$B/site-packages:$B/tpu-sync:$B/tpu-sync/tpu_sync:${PYTHONPATH:-}"
+                export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$B/lib"
+                export PATH="$B/bin:$PATH"
+                export PYTHONUNBUFFERED=1
+
+                MODE="{{ .MODE | default "offload_cluster" }}"
+                BACKEND="{{ .BACKEND | default "mooncake" }}"
+                DISAGG_CONNECTOR="{{ .DISAGG_CONNECTOR | default "tpusync_store" }}"
+                MODEL="{{ .MODEL | default "Qwen/Qwen3-32B" }}"
+                TP_SIZE="{{ .TP_SIZE | default "8" }}"
+                MAX_MODEL_LEN="{{ .MAX_MODEL_LEN | default "16384" }}"
+                GPU_MEM_UTIL="{{ .GPU_MEM_UTIL | default "0.70" }}"
+                KV_CACHE_DTYPE="{{ .KV_CACHE_DTYPE | default "fp8" }}"
+                BLOCK_SIZE="{{ .BLOCK_SIZE | default "128" }}"
+                HOST_CACHE_GB="{{ .HOST_CACHE_GB | default "32" }}"
+                VLLM_EXTRA_ARGS="{{ .VLLM_EXTRA_ARGS | default "" }}"
+                NODE_ID=$(( ${PEER_INDEX:-0} + 1 ))
+
+                INIT_HOST="${JS_NAME}-initiator-0-0.${JS_NAME}"
+                INIT_IP=""
+                for _ in $(seq 1 120); do
+                  INIT_IP=$(python3 -c "import socket,sys; print(socket.gethostbyname(sys.argv[1]))" "$INIT_HOST" 2>/dev/null || true)
+                  [ -n "$INIT_IP" ] && break
+                  sleep 1
+                done
+                [ -n "$INIT_IP" ] || { echo "Failed to resolve $INIT_HOST" >&2; exit 1; }
+                MY_IP=$(hostname -i | awk '{print $1}')
+
+                wait_tcp() {
+                  local host="$1" port="$2"
+                  python3 - "$host" "$port" <<'PY'
+                import socket, sys, time
+                h, p = sys.argv[1], int(sys.argv[2])
+                for _ in range(300):
+                    try:
+                        with socket.create_connection((h, p), timeout=2):
+                            sys.exit(0)
+                    except OSError:
+                        time.sleep(1)
+                sys.exit(1)
+                PY
+                }
+
+                KV_ARGS=()
+                COMMON_ARGS=(
+                  --model "$MODEL"
+                  --host 0.0.0.0
+                  --tensor-parallel-size "$TP_SIZE"
+                  --max-model-len "$MAX_MODEL_LEN"
+                  --gpu-memory-utilization "$GPU_MEM_UTIL"
+                  --kv-cache-dtype "$KV_CACHE_DTYPE"
+                  --block-size "$BLOCK_SIZE"
+                  --seed 42
+                )
+
+                if [ "$MODE" = "offload_cluster" ]; then
+                  PORT=8400
+                  COMMON_ARGS+=(--port "$PORT" --enable-prefix-caching --enable-chunked-prefill --disable-hybrid-kv-cache-manager)
+                  case "$BACKEND" in
+                    baseline)
+                      ;;
+                    mooncake)
+                      wait_tcp "$INIT_IP" 50051
+                      wait_tcp "$INIT_IP" 8080
+                      export MOONCAKE_MASTER_ADDR="${INIT_IP}:50051"
+                      export MOONCAKE_METADATA_URL="http://${INIT_IP}:8080/metadata"
+                      export MOONCAKE_HOST_IP="$MY_IP"
+                      export MOONCAKE_GLOBAL_SEGMENT_GB="$HOST_CACHE_GB"
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUOffloadConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_both"}')
+                      ;;
+                    tpu_sync)
+                      wait_tcp "$INIT_IP" 50051
+                      export TPUSYNC_REGISTRY_ADDR="${INIT_IP}:50051"
+                      export TPUSYNC_HOST_IP="$MY_IP"
+                      export TPUSYNC_NODE_ID="$NODE_ID"
+                      export TPUSYNC_HOST_CACHE_GB="$HOST_CACHE_GB"
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUOffloadConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_both"}')
+                      ;;
+                    raiden_local)
+                      export TPU_OFFLOAD_NUM_CPU_CHUNKS="${TPU_OFFLOAD_NUM_CPU_CHUNKS:-8192}"
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"RaidenOffloadConnector","kv_connector_module_path":"tpu_inference.offload.raiden_offload_connector","kv_role":"kv_both"}')
+                      ;;
+                    tpu_offload)
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUOffloadConnector","kv_connector_module_path":"tpu_inference.offload.tpu_offload_connector","kv_role":"kv_both"}')
+                      ;;
+                    *)
+                      echo "Unknown BACKEND=$BACKEND for offload_cluster" >&2; exit 1 ;;
+                  esac
+                elif [ "$MODE" = "disagg_1p1d" ]; then
+                  PORT=9400
+                  COMMON_ARGS+=(--port "$PORT" --no-enable-prefix-caching --async-scheduling --max-num-batched-tokens 8192)
+                  case "$BACKEND" in
+                    mooncake)
+                      wait_tcp "$INIT_IP" 50051
+                      wait_tcp "$INIT_IP" 8080
+                      export MOONCAKE_MASTER_ADDR="${INIT_IP}:50051"
+                      export MOONCAKE_METADATA_URL="http://${INIT_IP}:8080/metadata"
+                      export MOONCAKE_HOST_IP="$MY_IP"
+                      export MOONCAKE_GLOBAL_SEGMENT_GB="${MOONCAKE_DECODE_SEGMENT_GB:-4}"
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUDisaggConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_consumer"}')
+                      ;;
+                    tpu_sync)
+                      if [ "$DISAGG_CONNECTOR" = "raiden" ]; then
+                        export RAIDEN_NUM_SLOTS="${RAIDEN_NUM_SLOTS:-30}"
+                        export RAIDEN_TRANSPORT_PARALLELISM="${RAIDEN_TRANSPORT_PARALLELISM:-32}"
+                        export TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT:-9100}"
+                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"tpu_inference.distributed.tpu_raiden_connector","kv_role":"kv_consumer"}')
+                      else
+                        wait_tcp "$INIT_IP" 50051
+                        export TPUSYNC_REGISTRY_ADDR="${INIT_IP}:50051"
+                        export TPUSYNC_HOST_IP="$MY_IP"
+                        export TPUSYNC_NODE_ID="$NODE_ID"
+                        export TPUSYNC_HOST_CACHE_GB="${TPUSYNC_DECODE_CACHE_GB:-4}"
+                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUDisaggConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_consumer"}')
+                      fi
+                      ;;
+                    *)
+                      echo "Unknown BACKEND=$BACKEND for disagg_1p1d" >&2; exit 1 ;;
+                  esac
+                else
+                  echo "Unknown MODE=$MODE" >&2; exit 1
+                fi
+
+                echo "[peer $NODE_ID] starting vllm serve mode=$MODE backend=$BACKEND port=$PORT ip=$MY_IP init=$INIT_IP"
+                # shellcheck disable=SC2086
+                exec vllm serve "${COMMON_ARGS[@]}" "${KV_ARGS[@]}" $VLLM_EXTRA_ARGS
+              resources:
+                limits:
+                  cpu: "{{ .CPU | default "120" }}"
+                  memory: "{{ .MEMORY | default "400Gi" }}"
+                  google.com/tpu: 4
+                requests:
+                  cpu: "{{ .CPU | default "120" }}"
+                  memory: "{{ .MEMORY | default "400Gi" }}"
+                  google.com/tpu: 4
+            restartPolicy: Never
+
+  - name: initiator
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: "tpu7x"
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: hf-token-volume
+              secret:
+                secretName: vllm-hf-token
+                optional: true
+                items:
+                - key: HF_TOKEN
+                  path: token
+            - name: huggingface-storage
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    accessModes: ["ReadWriteOnce"]
+                    storageClassName: "premium-rwo"
+                    resources:
+                      requests:
+                        storage: 100Gi
+            containers:
+            - name: initiator
+              image: {{ .IMAGE | default "vllm/vllm-tpu:nightly" }}
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: hf-token-volume
+                mountPath: /var/run/hf-token
+                readOnly: true
+              - name: huggingface-storage
+                mountPath: /root/.cache/huggingface
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - {name: MEGASCALE_NUM_SLICES, value: ""}
+              - {name: MEGASCALE_SLICE_ID, value: ""}
+              - {name: MEGASCALE_PORT, value: ""}
+              - {name: MEGASCALE_COORDINATOR_ADDRESS, value: ""}
+              - {name: JAX_PLATFORMS, value: "tpu,cpu"}
+              - {name: TPU_BACKEND_TYPE, value: "jax"}
+              - {name: PJRT_DEVICE, value: "TPU"}
+              - {name: MODEL_IMPL_TYPE, value: "vllm"}
+              - {name: HF_TOKEN, value: "{{ .HF_TOKEN | default "" }}"}
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -euo pipefail
+                unset MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID MEGASCALE_PORT MEGASCALE_COORDINATOR_ADDRESS
+                [ -z "${HF_TOKEN:-}" ] && [ -s /var/run/hf-token/token ] && export HF_TOKEN="$(cat /var/run/hf-token/token)"
+                [ -z "${HF_TOKEN:-}" ] && unset HF_TOKEN
+                sysctl -w vm.max_map_count=8388608 2>/dev/null || true
+                if [ -w /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                  echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit 2>/dev/null || true
+                fi
+
+                B=/opt/mooncake-vllm
+                export PYTHONPATH="$B/vllm_bench:$B/site-packages:$B/tpu-sync:$B/tpu-sync/tpu_sync:${PYTHONPATH:-}"
+                export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$B/lib"
+                export PATH="$B/bin:$PATH"
+                export PYTHONUNBUFFERED=1
+                cat "$B/BUNDLE_INFO"
+
+                MODE="{{ .MODE | default "offload_cluster" }}"
+                BACKEND="{{ .BACKEND | default "mooncake" }}"
+                DISAGG_CONNECTOR="{{ .DISAGG_CONNECTOR | default "tpusync_store" }}"
+                PEERS="{{ .PEERS | default "1" }}"
+                MODEL="{{ .MODEL | default "Qwen/Qwen3-32B" }}"
+                TP_SIZE="{{ .TP_SIZE | default "8" }}"
+                MAX_MODEL_LEN="{{ .MAX_MODEL_LEN | default "16384" }}"
+                GPU_MEM_UTIL="{{ .GPU_MEM_UTIL | default "0.70" }}"
+                KV_CACHE_DTYPE="{{ .KV_CACHE_DTYPE | default "fp8" }}"
+                BLOCK_SIZE="{{ .BLOCK_SIZE | default "128" }}"
+                HOST_CACHE_GB="{{ .HOST_CACHE_GB | default "32" }}"
+                ROUTER_POLICY="{{ .ROUTER_POLICY | default "round_robin" }}"
+                VLLM_EXTRA_ARGS="{{ .VLLM_EXTRA_ARGS | default "" }}"
+                BENCH_ARGS="{{ .BENCH_ARGS | default "" }}"
+
+                OUT="${CDK_OUTPUT_DIR:-/tmp/tpu_vllm_bench}"
+                mkdir -p "$OUT"
+                MY_IP=$(hostname -i | awk '{print $1}')
+
+                BG_PIDS=()
+                cleanup() {
+                  for pid in "${BG_PIDS[@]}"; do
+                    kill "$pid" 2>/dev/null || true
+                  done
+                  wait 2>/dev/null || true
+                }
+                trap cleanup EXIT
+
+                wait_tcp() {
+                  local host="$1" port="$2"
+                  python3 - "$host" "$port" <<'PY'
+                import socket, sys, time
+                h, p = sys.argv[1], int(sys.argv[2])
+                for _ in range(180):
+                    try:
+                        with socket.create_connection((h, p), timeout=2):
+                            sys.exit(0)
+                    except OSError:
+                        time.sleep(1)
+                sys.exit(1)
+                PY
+                }
+
+                wait_health() {
+                  local url="$1"
+                  echo "[initiator] waiting for $url ..."
+                  python3 - "$url" <<'PY'
+                import sys, time, urllib.request
+                url = sys.argv[1]
+                for i in range(1800):
+                    try:
+                        with urllib.request.urlopen(url, timeout=3) as r:
+                            if r.status == 200:
+                                print(f"[initiator] ready: {url} (after {i}s)", flush=True)
+                                sys.exit(0)
+                    except Exception:
+                        pass
+                    if i % 30 == 0 and i > 0:
+                        print(f"[initiator] still waiting on {url} ({i}s)...", flush=True)
+                    time.sleep(1)
+                print(f"[initiator] timed out waiting for {url}", file=sys.stderr)
+                sys.exit(1)
+                PY
+                }
+
+                # 1. Start distributed control plane for the selected backend.
+                if [ "$BACKEND" = "mooncake" ]; then
+                  "$B/bin/mooncake_master" \
+                    --rpc_port=50051 \
+                    --enable_http_metadata_server=true \
+                    --http_metadata_server_host=0.0.0.0 \
+                    --http_metadata_server_port=8080 \
+                    --eviction_ratio=0.10 \
+                    --eviction_high_watermark_ratio=0.85 \
+                    >"$OUT/mooncake_master.log" 2>&1 &
+                  BG_PIDS+=($!)
+                  wait_tcp 127.0.0.1 50051
+                  wait_tcp 127.0.0.1 8080
+                  export MOONCAKE_MASTER_ADDR="${MY_IP}:50051"
+                  export MOONCAKE_METADATA_URL="http://${MY_IP}:8080/metadata"
+                  export MOONCAKE_HOST_IP="$MY_IP"
+                  export MOONCAKE_GLOBAL_SEGMENT_GB="$HOST_CACHE_GB"
+                elif [ "$BACKEND" = "tpu_sync" ] && ! { [ "$MODE" = "disagg_1p1d" ] && [ "$DISAGG_CONNECTOR" = "raiden" ]; }; then
+                  "$B/bin/global_registry_server" --port=50051 \
+                    >"$OUT/global_registry.log" 2>&1 &
+                  BG_PIDS+=($!)
+                  wait_tcp 127.0.0.1 50051
+                  export TPUSYNC_REGISTRY_ADDR="${MY_IP}:50051"
+                  export TPUSYNC_HOST_IP="$MY_IP"
+                  export TPUSYNC_NODE_ID="0"
+                  export TPUSYNC_HOST_CACHE_GB="$HOST_CACHE_GB"
+                fi
+
+                # 2. Start local vLLM engine (pod 0 / prefiller) on :8400.
+                KV_ARGS=()
+                COMMON_ARGS=(
+                  --model "$MODEL"
+                  --host 0.0.0.0
+                  --port 8400
+                  --tensor-parallel-size "$TP_SIZE"
+                  --max-model-len "$MAX_MODEL_LEN"
+                  --gpu-memory-utilization "$GPU_MEM_UTIL"
+                  --kv-cache-dtype "$KV_CACHE_DTYPE"
+                  --block-size "$BLOCK_SIZE"
+                  --seed 42
+                )
+
+                if [ "$MODE" = "offload_cluster" ]; then
+                  COMMON_ARGS+=(--enable-prefix-caching --enable-chunked-prefill --disable-hybrid-kv-cache-manager)
+                  case "$BACKEND" in
+                    baseline) ;;
+                    mooncake)
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUOffloadConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_both"}') ;;
+                    tpu_sync)
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUOffloadConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_both"}') ;;
+                    raiden_local)
+                      export TPU_OFFLOAD_NUM_CPU_CHUNKS="${TPU_OFFLOAD_NUM_CPU_CHUNKS:-8192}"
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"RaidenOffloadConnector","kv_connector_module_path":"tpu_inference.offload.raiden_offload_connector","kv_role":"kv_both"}') ;;
+                    tpu_offload)
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUOffloadConnector","kv_connector_module_path":"tpu_inference.offload.tpu_offload_connector","kv_role":"kv_both"}') ;;
+                    *) echo "Unknown BACKEND=$BACKEND" >&2; exit 1 ;;
+                  esac
+                elif [ "$MODE" = "disagg_1p1d" ]; then
+                  COMMON_ARGS+=(--no-enable-prefix-caching --async-scheduling --max-num-batched-tokens 8192)
+                  case "$BACKEND" in
+                    mooncake)
+                      KV_ARGS=(--kv-transfer-config '{"kv_connector":"MooncakeTPUDisaggConnector","kv_connector_module_path":"mooncake_tpu_connector","kv_role":"kv_producer"}') ;;
+                    tpu_sync)
+                      if [ "$DISAGG_CONNECTOR" = "raiden" ]; then
+                        export RAIDEN_NUM_SLOTS="${RAIDEN_NUM_SLOTS:-30}"
+                        export RAIDEN_TRANSPORT_PARALLELISM="${RAIDEN_TRANSPORT_PARALLELISM:-32}"
+                        export TPU_KV_TRANSFER_PORT="${TPU_KV_TRANSFER_PORT:-9100}"
+                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TPUConnector","kv_connector_module_path":"tpu_inference.distributed.tpu_raiden_connector","kv_role":"kv_producer"}')
+                      else
+                        KV_ARGS=(--kv-transfer-config '{"kv_connector":"TpuSyncTPUDisaggConnector","kv_connector_module_path":"tpusync_tpu_connector","kv_role":"kv_producer"}')
+                      fi
+                      ;;
+                    *) echo "Unknown BACKEND=$BACKEND for disagg_1p1d" >&2; exit 1 ;;
+                  esac
+                else
+                  echo "Unknown MODE=$MODE" >&2; exit 1
+                fi
+
+                echo "[initiator] starting vllm serve mode=$MODE backend=$BACKEND ip=$MY_IP"
+                # shellcheck disable=SC2086
+                vllm serve "${COMMON_ARGS[@]}" "${KV_ARGS[@]}" $VLLM_EXTRA_ARGS \
+                  >"$OUT/vllm_initiator.log" 2>&1 &
+                BG_PIDS+=($!)
+
+                # 3. Wait for local vLLM and all peer vLLM pods to become healthy.
+                wait_health "http://127.0.0.1:8400/health"
+                PEER_HOSTS=()
+                METRICS_EPS="http://127.0.0.1:8400"
+                ROUTER_BACKENDS=("127.0.0.1:8400")
+                PEER_PORT=$([ "$MODE" = "disagg_1p1d" ] && echo 9400 || echo 8400)
+                for idx in $(seq 0 $(( PEERS - 1 ))); do
+                  ph="${JS_NAME}-peer-${idx}-0.${JS_NAME}"
+                  wait_health "http://${ph}:${PEER_PORT}/health"
+                  PEER_HOSTS+=("$ph")
+                  METRICS_EPS="${METRICS_EPS},http://${ph}:${PEER_PORT}"
+                  ROUTER_BACKENDS+=("${ph}:${PEER_PORT}")
+                done
+
+                # 4. Launch front-end router / disagg proxy on :8000.
+                if [ "$MODE" = "offload_cluster" ]; then
+                  python3 "$B/vllm_bench/rr_router.py" \
+                    --host 0.0.0.0 --port 8000 \
+                    --policy "$ROUTER_POLICY" \
+                    --backends "${ROUTER_BACKENDS[@]}" \
+                    >"$OUT/router.log" 2>&1 &
+                  BG_PIDS+=($!)
+                  wait_health "http://127.0.0.1:8000/health"
+                  if [ -z "$BENCH_ARGS" ]; then
+                    BENCH_ARGS="--scenarios shared_prefix_offload,multiturn_chat,fast25_conversation --num-prefixes 8 --prefix-tokens 8192 --suffix-tokens 128 --output-tokens 128 --num-prompts 80 --qps 2.0"
+                  fi
+                else
+                  DECODER_PORTS=()
+                  for _ in "${PEER_HOSTS[@]}"; do DECODER_PORTS+=(9400); done
+                  python3 "$B/vllm_bench/toy_proxy_server.py" \
+                    --host 0.0.0.0 --port 8000 \
+                    --prefiller-hosts 127.0.0.1 --prefiller-ports 8400 \
+                    --decoder-hosts "${PEER_HOSTS[@]}" --decoder-ports "${DECODER_PORTS[@]}" \
+                    >"$OUT/proxy.log" 2>&1 &
+                  BG_PIDS+=($!)
+                  wait_tcp 127.0.0.1 8000
+                  if [ -z "$BENCH_ARGS" ]; then
+                    BENCH_ARGS="--scenarios disagg_slo_sweep --prefix-tokens 8192 --output-tokens 128 --num-prompts 48 --qps-sweep 1,2,4"
+                  fi
+                fi
+
+                # 5. Execute Tier 3 serving benchmark harness and persist metrics.
+                # shellcheck disable=SC2086
+                python3 "$B/vllm_bench/serve_bench.py" \
+                  --mode run \
+                  --endpoint "http://127.0.0.1:8000" \
+                  --metrics-endpoints "$METRICS_EPS" \
+                  --model "$MODEL" \
+                  --label "${MODE}_${BACKEND}" \
+                  --trace-dir "$B/traces" \
+                  --output-json "$OUT/vllm_${MODE}_${BACKEND}.json" \
+                  $BENCH_ARGS \
+                  | tee "$OUT/bench.log"
+
+                echo "=== External prefix cache log tail (initiator) ==="
+                grep -E "External prefix cache hit rate" "$OUT/vllm_initiator.log" | tail -n 10 || true
+              resources:
+                limits:
+                  cpu: "{{ .CPU | default "120" }}"
+                  memory: "{{ .MEMORY | default "400Gi" }}"
+                  google.com/tpu: 4
+                requests:
+                  cpu: "{{ .CPU | default "120" }}"
+                  memory: "{{ .MEMORY | default "400Gi" }}"
+                  google.com/tpu: 4
+            restartPolicy: Never
