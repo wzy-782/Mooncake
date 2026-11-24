@@ -74,8 +74,7 @@ struct LogicalTransferRuntimePolicy {
 // request itself was routed.
 struct StagedRoute {
     Request request;
-    int transport_index{0};  // Its current candidate; hops fail over from it.
-    SelectionResult route;   // Its route at that candidate, without staging.
+    SelectionResult route;  // Staged request's route, without staging.
 };
 
 struct TaskInfo {
@@ -95,6 +94,7 @@ struct TaskInfo {
     // Set on a staged request's host-to-host hops, which route with it.
     std::shared_ptr<const StagedRoute> staged_route;
     bool staging{false};
+    bool staged_retried{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     std::atomic<TransferStatusEnum> staging_status{TransferStatusEnum::PENDING};
@@ -144,6 +144,7 @@ struct TaskInfo {
           public_length(other.public_length),
           staged_route(other.staged_route),
           staging(other.staging),
+          staged_retried(other.staged_retried),
           cancel_requested(other.cancel_requested),
           status(other.status),
           staging_status(other.staging_status.load(std::memory_order_relaxed)),
@@ -176,6 +177,7 @@ struct TaskInfo {
           public_length(other.public_length),
           staged_route(std::move(other.staged_route)),
           staging(other.staging),
+          staged_retried(other.staged_retried),
           cancel_requested(other.cancel_requested),
           status(other.status),
           staging_status(other.staging_status.load(std::memory_order_relaxed)),
@@ -209,6 +211,7 @@ struct TaskInfo {
             public_length = other.public_length;
             staged_route = other.staged_route;
             staging = other.staging;
+            staged_retried = other.staged_retried;
             cancel_requested = other.cancel_requested;
             status = other.status;
             staging_status.store(
@@ -246,6 +249,7 @@ struct TaskInfo {
             public_length = other.public_length;
             staged_route = std::move(other.staged_route);
             staging = other.staging;
+            staged_retried = other.staged_retried;
             cancel_requested = other.cancel_requested;
             status = other.status;
             staging_status.store(
@@ -598,8 +602,9 @@ class TransferEngineImpl {
 
     // Null when the hops route by themselves.
     static std::shared_ptr<const StagedRoute> hopRoute(
-        const SelectionResult& route, const Request& request,
-        int transport_index);
+        const SelectionResult& route, const Request& request);
+
+    bool batchSuppressesFailover(BatchID batch_id);
 
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);

@@ -99,6 +99,7 @@ class RecordingTransport : public Transport {
         return submissions_;
     }
     void refuseSubmissions() { refuse_ = true; }
+    void failStatusWithRpcServiceError() { fail_status_rpc_error_ = true; }
 
     Status submitTransferTasks(SubBatchRef batch,
                                const std::vector<Request>& requests) override {
@@ -124,7 +125,12 @@ class RecordingTransport : public Transport {
     }
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override {
-        return real_->getTransferStatus(batch, task_id, status);
+        auto st = real_->getTransferStatus(batch, task_id, status);
+        if (fail_status_rpc_error_ && st.ok() && status.s != PENDING) {
+            status = {FAILED, 0};
+            return Status::RpcServiceError("uncertain write" LOC_MARK);
+        }
+        return st;
     }
     Status retryTransferTask(SubBatchRef batch, int task_id,
                              const Request& request) override {
@@ -178,6 +184,7 @@ class RecordingTransport : public Transport {
     mutable std::mutex mutex_;
     std::vector<Submission> submissions_;
     std::atomic<bool> refuse_{false};
+    std::atomic<bool> fail_status_rpc_error_{false};
 };
 
 // Stands in for RDMA. Both engines live in this process, so a remote
@@ -274,8 +281,10 @@ class TpuStagedRouteTest : public ::testing::TestWithParam<Params> {
     }
 
     // Starts both engines, with `network` (TCP or HP TCP) and the RDMA
-    // stand-in. `extra` is merged into the configuration.
-    void start(TransportType network, const json& extra = json::object()) {
+    // stand-in (skipped on peer when `peer_rdma` is false). `extra` is merged
+    // into the configuration.
+    void start(TransportType network, const json& extra = json::object(),
+               bool peer_rdma = true) {
         auto conf = std::make_shared<Config>();
         conf->set("metadata_type", "p2p");
         conf->set("metadata_servers", "");
@@ -300,10 +309,12 @@ class TpuStagedRouteTest : public ::testing::TestWithParam<Params> {
         ASSERT_TRUE(a_->available());
         ASSERT_TRUE(b_->available());
         for (auto* engine : {a_.get(), b_.get()}) {
-            auto rdma = std::make_shared<LoopbackRdma>();
-            auto name = engine->getSegmentName();
-            ASSERT_TRUE(rdma->install(name, nullptr, nullptr).ok());
-            engine->swapTransportForTest(RDMA, rdma);
+            if (engine == a_.get() || peer_rdma) {
+                auto rdma = std::make_shared<LoopbackRdma>();
+                auto name = engine->getSegmentName();
+                ASSERT_TRUE(rdma->install(name, nullptr, nullptr).ok());
+                engine->swapTransportForTest(RDMA, rdma);
+            }
             TransferEngineImplTestPeer::smallStagePool(*engine);
         }
         for (auto type : {RDMA, network, TPU}) {
@@ -345,13 +356,14 @@ class TpuStagedRouteTest : public ::testing::TestWithParam<Params> {
     // completed transfer must have copied every byte; any other outcome must
     // have left the destination untouched.
     TransferStatusEnum transfer(const Request& r) {
+        const size_t len = r.length;
         auto* source = static_cast<uint8_t*>(
             device_data_(r.opcode == Request::WRITE ? local_ : remote_));
         auto* dest = static_cast<uint8_t*>(
             device_data_(r.opcode == Request::WRITE ? remote_ : local_));
         ++seed_;
-        for (size_t i = 0; i < kLength; ++i) source[i] = (i * 13 + seed_) % 251;
-        std::memset(dest, 0, kLength);
+        for (size_t i = 0; i < len; ++i) source[i] = (i * 13 + seed_) % 251;
+        std::memset(dest, 0, len);
         auto batch = a_->allocateBatch(1);
         EXPECT_NE(batch, 0u);
         if (!a_->submitTransfer(batch, {r}).ok()) {
@@ -369,9 +381,9 @@ class TpuStagedRouteTest : public ::testing::TestWithParam<Params> {
         } while (std::chrono::steady_clock::now() < deadline);
         EXPECT_TRUE(a_->freeBatch(batch).ok());
         if (status.s == COMPLETED) {
-            EXPECT_EQ(0, std::memcmp(dest, source, kLength));
+            EXPECT_EQ(0, std::memcmp(dest, source, len));
         } else {
-            for (size_t i = 0; i < kLength; ++i)
+            for (size_t i = 0; i < len; ++i)
                 if (dest[i] != 0) {
                     ADD_FAILURE() << "destination byte " << i << " changed";
                     break;
@@ -550,6 +562,95 @@ TEST_P(TpuStagedRouteTest, RuntimeQueueDoesNotDropDeadlinedChunks) {
     r.deadline_ns = deadlineIn(std::chrono::seconds(1));
     EXPECT_EQ(transfer(r), COMPLETED);
     expectChunksOnlyOn(RDMA, 1);
+}
+
+TEST_P(TpuStagedRouteTest, AsymmetricPeerSkipsTransportsPeerDoesNotRun) {
+    ASSERT_NO_FATAL_FAILURE(
+        start(TCP, {{"max_failover_attempts", 0}}, /*peer_rdma=*/false));
+    for (auto opcode : {Request::WRITE, Request::READ})
+        EXPECT_EQ(transfer(request(opcode)), COMPLETED);
+    expectChunksOnlyOn(TCP, 2);
+}
+
+TEST_P(TpuStagedRouteTest, AsymmetricPeerSkipsUnavailablePolicyTransport) {
+    if (legacy()) GTEST_SKIP() << "Legacy selection ignores policies";
+    ASSERT_NO_FATAL_FAILURE(
+        start(TCP,
+              {{"max_failover_attempts", 0},
+               {"policy", tpuPolicies({"rdma", "tcp"}, {"tpu", "rdma"})}},
+              /*peer_rdma=*/false));
+    for (auto opcode : {Request::WRITE, Request::READ})
+        EXPECT_EQ(transfer(request(opcode)), COMPLETED);
+    expectChunksOnlyOn(TCP, 2);
+}
+
+TEST_P(TpuStagedRouteTest, NonReplayableTcpWriteDoesNotRetryStaging) {
+    ASSERT_NO_FATAL_FAILURE(start(TCP, {{"max_failover_attempts", 3}}));
+    recorders_[TCP]->failStatusWithRpcServiceError();
+    auto r = request(Request::WRITE, TCP);
+    r.length = 4096;
+    EXPECT_EQ(transfer(r), FAILED);
+    EXPECT_EQ(submitted(TCP).size(), 1u);
+    EXPECT_TRUE(submitted(RDMA).empty());
+}
+
+TEST_P(TpuStagedRouteTest, PersistentStagingFailureCapsRetries) {
+    ASSERT_NO_FATAL_FAILURE(start(TCP, {{"max_failover_attempts", 3}}));
+    recorders_[TCP]->refuseSubmissions();
+    recorders_[RDMA]->refuseSubmissions();
+    auto r = request(Request::WRITE, TCP);
+    r.length = 4096;
+    EXPECT_EQ(transfer(r), FAILED);
+    // Initial staged attempt plus at most one restage, not max_failover_attempts.
+    EXPECT_EQ(submitted(TCP).size(), 2u);
+    EXPECT_EQ(submitted(RDMA).size(), 2u);
+}
+
+TEST_P(TpuStagedRouteTest,
+       CustomTpuPolicyWithoutTpuKeepsLocalHbmCopiesOnTpuTransport) {
+    if (legacy()) GTEST_SKIP() << "Legacy selection ignores policies";
+    json policy = json::array({{{"name", "all_rdma"},
+                                {"segment_type", "memory"},
+                                {"transports", {"rdma"}}}});
+    ASSERT_NO_FATAL_FAILURE(start(TCP, {{"policy", policy}}));
+    for (auto opcode : {Request::WRITE, Request::READ})
+        EXPECT_EQ(transfer(request(opcode)), COMPLETED);
+    expectChunksOnlyOn(RDMA, 2);
+    EXPECT_EQ(submitted(TPU).size(), 2 * kChunks);
+    EXPECT_EQ(peer_tpu_->submissions().size(), 2 * kChunks);
+}
+
+TEST_P(TpuStagedRouteTest, IntentAndPolicyNameRouteEveryChunk) {
+    if (legacy()) GTEST_SKIP() << "Legacy selection ignores policies";
+    json policies = json::array({{{"name", "prefetch_tcp"},
+                                  {"segment_type", "memory"},
+                                  {"intent_type", "background_prefetch"},
+                                  {"transports", {"tcp"}}},
+                                 {{"name", "small_rdma"},
+                                  {"segment_type", "memory"},
+                                  {"max_size", kChunk},
+                                  {"transports", {"rdma"}}},
+                                 {{"name", "default_rdma"},
+                                  {"segment_type", "memory"},
+                                  {"transports", {"rdma"}}},
+                                 {{"name", "named_tcp"},
+                                  {"segment_type", "memory"},
+                                  {"transports", {"tcp"}}}});
+    ASSERT_NO_FATAL_FAILURE(start(TCP, {{"policy", policies}}));
+
+    auto prefetch = request(Request::WRITE);
+    prefetch.intent_type = IntentType::BACKGROUND_PREFETCH;
+    EXPECT_EQ(transfer(prefetch), COMPLETED);
+    expectChunksOnlyOn(TCP, 1);
+
+    auto by_name = request(Request::WRITE);
+    by_name.policy_name = "named_tcp";
+    EXPECT_EQ(transfer(by_name), COMPLETED);
+    expectChunksOnlyOn(TCP, 2);
+
+    EXPECT_EQ(transfer(request(Request::WRITE)), COMPLETED);
+    EXPECT_EQ(submitted(TCP).size(), 2 * kChunks);
+    EXPECT_EQ(submitted(RDMA).size(), kChunks);
 }
 
 INSTANTIATE_TEST_SUITE_P(

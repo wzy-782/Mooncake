@@ -441,12 +441,14 @@ void ProxyManager::runner(size_t id) {
         flushPendingCleanups();
         StageBufferCache cache(*this);
         bool buffers_safe_to_release = true;
+        bool suppress_failover = false;
         std::vector<BatchID> undrained_batches;
         std::vector<std::shared_ptr<internal::RemoteStageOperation>>
             undrained_remote_operations;
         auto status =
             transferEventLoop(task, &cache, buffers_safe_to_release,
-                              undrained_batches, undrained_remote_operations);
+                              suppress_failover, undrained_batches,
+                              undrained_remote_operations);
         // A failed sibling does not stop copies already using the caller's
         // buffer. Keep the parent PENDING until those copies are terminal.
         // Shutdown still uses the existing bounded deferred-teardown path.
@@ -458,6 +460,8 @@ void ProxyManager::runner(size_t id) {
                 TransferStatus child_status;
                 auto polled = impl_->progressBatch(*it, child_status);
                 if (polled.ok() && child_status.s != PENDING) {
+                    if (impl_->batchSuppressesFailover(*it))
+                        suppress_failover = true;
                     impl_->releaseBatch(reinterpret_cast<Batch*>(*it));
                     it = undrained_batches.erase(it);
                 } else {
@@ -497,6 +501,7 @@ void ProxyManager::runner(size_t id) {
             }
         }
         if (buffers_safe_to_release) {
+            if (suppress_failover) task.native->suppress_failover = true;
             task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
                                               std::memory_order_release);
             impl_->notifyBatchMaybeReady(task.batch);
@@ -506,10 +511,11 @@ void ProxyManager::runner(size_t id) {
 
 Status ProxyManager::transferEventLoop(
     StagingTask& task, StageBufferCache* cache, bool& buffers_safe_to_release,
-    std::vector<BatchID>& undrained_batches,
+    bool& suppress_failover, std::vector<BatchID>& undrained_batches,
     std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
         undrained_remote_operations) {
     buffers_safe_to_release = true;
+    suppress_failover = false;
     auto& request = task.native->request;
     const auto& route = task.route;
     auto server_addr = task.params[0];
@@ -587,6 +593,9 @@ Status ProxyManager::transferEventLoop(
             LOG(ERROR) << "Failed to poll in-flight staging batch: " << status;
             impl_->freeBatch(batch);
             return false;
+        }
+        if (xfer_status.s != PENDING && impl_->batchSuppressesFailover(batch)) {
+            suppress_failover = true;
         }
         auto free_status = impl_->freeBatch(batch);
         if (!free_status.ok()) {
@@ -782,6 +791,9 @@ Status ProxyManager::transferEventLoop(
                     chunk.batch = 0;
                 } else if (xfer_status.s != PENDING) {
                     chunk.state = StageState::FAILED;
+                    if (impl_->batchSuppressesFailover(chunk.batch)) {
+                        suppress_failover = true;
+                    }
                     impl_->freeBatch(chunk.batch);
                     chunk.batch = 0;
                 }
@@ -809,6 +821,9 @@ Status ProxyManager::transferEventLoop(
                 auto result = operation->tryTakeResult();
                 if (result) {
                     if (!result->confirmed) {
+                        if (request.opcode == Request::WRITE) {
+                            suppress_failover = true;
+                        }
                         chunk.state = StageState::FAILED;
                         event_queue.push(id);
                         break;

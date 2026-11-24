@@ -76,7 +76,8 @@ class ProxyManager {
 
     Status transferEventLoop(
         StagingTask& task, StageBufferCache* cache,
-        bool& buffers_safe_to_release, std::vector<BatchID>& undrained_batches,
+        bool& buffers_safe_to_release, bool& suppress_failover,
+        std::vector<BatchID>& undrained_batches,
         std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
             undrained_remote_operations);
 
