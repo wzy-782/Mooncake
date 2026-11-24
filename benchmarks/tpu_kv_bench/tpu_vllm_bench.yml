@@ -108,7 +108,7 @@ spec:
 
                 B=/opt/mooncake-vllm
                 export PYTHONPATH="$B/vllm_bench:$B/site-packages:$B/tpu-sync:$B/tpu-sync/tpu_sync:${PYTHONPATH:-}"
-                export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$B/lib"
+                export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$B/lib:$B/site-packages/mooncake"
                 export PATH="$B/bin:$PATH"
                 export PYTHONUNBUFFERED=1
 
@@ -319,7 +319,7 @@ spec:
 
                 B=/opt/mooncake-vllm
                 export PYTHONPATH="$B/vllm_bench:$B/site-packages:$B/tpu-sync:$B/tpu-sync/tpu_sync:${PYTHONPATH:-}"
-                export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$B/lib"
+                export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$B/lib:$B/site-packages/mooncake"
                 export PATH="$B/bin:$PATH"
                 export PYTHONUNBUFFERED=1
                 cat "$B/BUNDLE_INFO"
@@ -368,12 +368,28 @@ spec:
                 }
 
                 wait_health() {
-                  local url="$1"
+                  local url="$1" watch_pid="${2:-}" log_file="${3:-}"
                   echo "[initiator] waiting for $url ..."
-                  python3 - "$url" <<'PY'
-                import sys, time, urllib.request
-                url = sys.argv[1]
+                  python3 - "$url" "$watch_pid" "$log_file" <<'PY'
+                import os, sys, time, urllib.request
+                url, pid_s, logf = sys.argv[1], sys.argv[2], sys.argv[3]
+                watch_pid = int(pid_s) if pid_s else 0
                 for i in range(1800):
+                    if watch_pid:
+                        dead = False
+                        try:
+                            with open(f"/proc/{watch_pid}/stat", "r") as sf:
+                                st = sf.read().split(") ", 1)[1].split(" ", 1)[0]
+                                if st == "Z":
+                                    dead = True
+                        except OSError:
+                            dead = True
+                        if dead:
+                            print(f"[initiator] watched process {watch_pid} exited early", file=sys.stderr, flush=True)
+                            if logf and os.path.isfile(logf):
+                                with open(logf, "r", errors="replace") as f:
+                                    print(f.read()[-4000:], file=sys.stderr, flush=True)
+                            sys.exit(1)
                     try:
                         with urllib.request.urlopen(url, timeout=3) as r:
                             if r.status == 200:
@@ -385,6 +401,9 @@ spec:
                         print(f"[initiator] still waiting on {url} ({i}s)...", flush=True)
                     time.sleep(1)
                 print(f"[initiator] timed out waiting for {url}", file=sys.stderr)
+                if logf and os.path.isfile(logf):
+                    with open(logf, "r", errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr, flush=True)
                 sys.exit(1)
                 PY
                 }
@@ -471,10 +490,11 @@ spec:
                 # shellcheck disable=SC2086
                 vllm serve "${COMMON_ARGS[@]}" "${KV_ARGS[@]}" $VLLM_EXTRA_ARGS \
                   >"$OUT/vllm_initiator.log" 2>&1 &
-                BG_PIDS+=($!)
+                VLLM_PID=$!
+                BG_PIDS+=("$VLLM_PID")
 
                 # 3. Wait for local vLLM and all peer vLLM pods to become healthy.
-                wait_health "http://127.0.0.1:8400/health"
+                wait_health "http://127.0.0.1:8400/health" "$VLLM_PID" "$OUT/vllm_initiator.log"
                 PEER_HOSTS=()
                 METRICS_EPS="http://127.0.0.1:8400"
                 ROUTER_BACKENDS=("127.0.0.1:8400")

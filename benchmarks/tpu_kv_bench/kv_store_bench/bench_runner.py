@@ -699,8 +699,18 @@ def start_backend_services(
         ]
         p = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
         procs.append(p)
-        wait_port_open("127.0.0.1", rpc_port, timeout_s=30.0)
-        wait_port_open("127.0.0.1", http_port, timeout_s=30.0)
+        try:
+            wait_port_open("127.0.0.1", rpc_port, timeout_s=30.0)
+            wait_port_open("127.0.0.1", http_port, timeout_s=30.0)
+        except Exception:
+            try:
+                log_f.flush()
+                with open(log_path, "r", encoding="utf-8", errors="replace") as rf:
+                    tail = rf.read()[-2000:]
+                print(f"[coordinator] mooncake_master failed (rc={proc.poll()}):\n{tail}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
+            raise
         return BackendServiceHandle(
             procs,
             log_files,

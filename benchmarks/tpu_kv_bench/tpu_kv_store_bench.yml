@@ -66,7 +66,7 @@ spec:
                 B=/opt/mooncake-bench
                 export PYTHONHOME=$B/python
                 export PYTHONPATH=$B/site-packages:$B/tpu-sync
-                export LD_LIBRARY_PATH=$B/lib
+                export LD_LIBRARY_PATH=$B/lib:$B/site-packages/mooncake
                 export PATH=$B/bin:$B/python/bin:$PATH
                 export PYTHONUNBUFFERED=1
                 export TPU_VISIBLE_CHIPS=0,1,2,3
@@ -128,7 +128,7 @@ spec:
                 B=/opt/mooncake-bench
                 export PYTHONHOME=$B/python
                 export PYTHONPATH=$B/site-packages:$B/tpu-sync
-                export LD_LIBRARY_PATH=$B/lib
+                export LD_LIBRARY_PATH=$B/lib:$B/site-packages/mooncake
                 export PATH=$B/bin:$B/python/bin:$PATH
                 export PYTHONUNBUFFERED=1
                 export TPU_VISIBLE_CHIPS=0,1,2,3

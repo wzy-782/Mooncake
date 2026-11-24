@@ -138,8 +138,10 @@ objects = [os.path.join(bindir, b) for b in os.listdir(bindir)]
 for root, _, files in os.walk(bundle):
     objects += [os.path.join(root, f) for f in files if re.search(r"\.so(\.\d+)*$", f)]
 needed = {}
+ldd_env = dict(os.environ)
+ldd_env["LD_LIBRARY_PATH"] = os.path.join(site, "mooncake") + ":" + ldd_env.get("LD_LIBRARY_PATH", "")
 for obj in objects:
-    ldd = subprocess.run(["ldd", obj], capture_output=True, text=True).stdout
+    ldd = subprocess.run(["ldd", obj], capture_output=True, text=True, env=ldd_env).stdout
     for name, path in re.findall(r"^\s*(\S+) => (/\S+)", ldd, re.M):
         if not skip_lib.match(name) and not path.startswith(bundle):
             needed[name] = path
