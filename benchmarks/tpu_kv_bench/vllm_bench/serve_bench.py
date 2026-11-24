@@ -32,20 +32,52 @@ from urllib.parse import urlparse
 # Deterministic vocabulary for constructing prompts with exact shared prefixes
 # ---------------------------------------------------------------------------
 
+# Common single-token English words (1 BPE token each under Qwen/Llama/GPT tokenizers)
+# so requested approx_tokens closely matches real tokenized prompt length.
 _VOCAB = [
-    f"tok{i:04d}" for i in range(4096)
+    "time", "year", "work", "line", "part", "place", "case", "point",
+    "fact", "hand", "high", "good", "long", "last", "same", "next",
+    "fast", "open", "real", "best", "true", "free", "full", "main",
+    "hard", "dark", "deep", "wide", "warm", "cool", "soft", "gold",
+    "blue", "gray", "tree", "road", "star", "wind", "rain", "snow",
+    "fire", "sand", "rock", "hill", "lake", "ship", "bird", "fish",
+    "book", "page", "word", "code", "data", "node", "edge", "path",
+    "loop", "list", "grid", "form", "view", "mode", "plan", "step",
+    "task", "goal", "rule", "test", "mark", "note", "sign", "name",
+    "card", "ring", "bell", "gate", "wall", "door", "room", "hall",
+    "desk", "lamp", "iron", "wire", "gear", "wave", "beam", "core",
+    "cell", "atom", "seed", "leaf", "root", "bark", "stem", "pine",
+    "palm", "rose", "mint", "sage", "corn", "rice", "salt", "milk",
+    "cake", "soup", "pear", "plum", "lime", "date", "bean", "silk",
+    "wool", "felt", "lace", "cord", "rope", "tape", "belt", "band",
+    "clip", "hook", "lock", "bolt", "nail", "pipe", "tube", "tank",
+    "pump", "mill", "oven", "rack", "cart", "boat", "sail", "mast",
+    "helm", "deck", "hull", "port", "pier", "dock", "cove", "gulf",
+    "cape", "reef", "peak", "pass", "vale", "pond", "pool", "well",
+    "arch", "span", "post", "pole", "rail", "lane", "mile", "yard",
+    "foot", "inch", "gram", "volt", "watt", "byte", "chip", "disk",
+    "host", "link", "mesh", "echo", "flow", "pipe", "zone", "tier",
+    "rank", "slot", "pool", "page", "size", "rate", "load", "save",
+    "read", "push", "pull", "send", "wait", "sync", "lock", "free",
+    "hold", "drop", "keep", "move", "swap", "copy", "pack", "sort",
+    "hash", "tree", "heap", "ring", "queue", "stack", "cache", "store",
+    "batch", "chunk", "block", "frame", "slice", "shard", "layer", "head",
+    "token", "model", "graph", "trace", "score", "metric", "clock", "timer",
+    "event", "queue", "route", "proxy", "peer", "host", "node", "cluster",
+    "river", "cloud", "stone", "light", "steel", "glass", "metal", "wood",
+    "earth", "ocean", "field", "plain", "ridge", "cliff", "shore", "coast",
+    "north", "south", "east", "west", "front", "back", "left", "right",
 ]
 
 
 def _make_block_text(block_id: int, approx_tokens: int) -> str:
     """Deterministic text chunk for a logical KV block ID.
 
-    Each token like ' tok0123' is ~2-3 BPE tokens; we scale word count so
-    shared block_ids produce byte-identical prompt prefixes across requests.
+    Uses single-BPE-token common English words so shared block_ids produce
+    byte-identical prompt prefixes whose tokenized length tracks approx_tokens.
     """
     rng = random.Random(block_id * 1000003 + 17)
-    # ~2 tokens per word under Qwen/Llama BPE; scale cleanly.
-    n_words = max(8, approx_tokens // 2)
+    n_words = max(8, int(approx_tokens * 0.90))
     return " ".join(_VOCAB[rng.randrange(len(_VOCAB))] for _ in range(n_words))
 
 
@@ -578,6 +610,9 @@ def summarize_scenario(
     measured = non_warm if non_warm else list(results)
     ok = [r for r in measured if r.ok]
     failed = len(measured) - len(ok)
+    if failed > 0:
+        sample_errs = sorted({r.error for r in measured if not r.ok and r.error})[:3]
+        print(f"[serve_bench] {label}/{scenario}: {failed} failed reqs; sample errors: {sample_errs}", flush=True)
     all_itls = [x for r in ok for x in r.itls_ms]
     slo_ok = sum(1 for r in ok if r.meets_slo)
 
